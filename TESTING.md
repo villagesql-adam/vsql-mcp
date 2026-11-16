@@ -68,6 +68,7 @@ on top of it, split by domain.
 | `t/mcp_types.test` | Round-trip fidelity for `DECIMAL`, 64-bit integers, `DOUBLE`, temporal types with fractional seconds, `JSON`, `BLOB`/`VARBINARY`/`BIT`/`GEOMETRY`, `ENUM`/`SET`, `utf8mb4`, `NULL`, multi-megabyte cells, and server-side `max_rows` truncation |
 | `t/mcp_concurrency.test` | 50-way fan-out with no crossed responses, loopback connection accounting, mixed fast/timing-out load, disabling the listener with a call in flight, 12 enable/disable cycles, which settings apply without a rebind, and exact status-counter deltas |
 | `t/mcp_tls.test` | A full MCP session over HTTPS, the guardrails on the TLS listener, both listeners serving at once, and the fail-closed paths when certificate material is missing or unreadable. Generates a self-signed certificate per run under `$MYSQL_TMP_DIR` (needs `openssl` on PATH) and removes it afterwards |
+| `t/mcp_ext_tools.test` | Tools that another extension declares: listing, calls with bound arguments, the `write` tool gate, refusal of a manifest that is not JSON, lacks a field, or names another extension's function, and removal on `UNINSTALL EXTENSION`. Builds its test extension from source with `cargo vsql package`, so it needs `cargo-vsql` on PATH and access to crates.io |
 | `t/mcp_client.inc` | The shared Python client every driver imports |
 | `t/mcp_env.inc`, `t/mcp_env_cleanup.inc` | The two-schema fixture and its teardown |
 | `t/<name>-master.opt` | Starts the MTR server with `--vsql_allow_preview_extensions=ON` |

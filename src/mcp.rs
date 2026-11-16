@@ -147,7 +147,7 @@ pub fn initialize_result(id: &Json) -> Json {
 pub fn dispatch(method: &str, params: &Json, id: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Json {
     match method {
         "ping" => result(id, json!({})),
-        "tools/list" => result(id, tools::list(cfg)),
+        "tools/list" => result(id, tools::list(cfg, exec)),
         "tools/call" => tools::call(params, id, cfg, exec),
         "resources/list" => match resources::list(cfg, exec) {
             Ok(value) => result(id, value),

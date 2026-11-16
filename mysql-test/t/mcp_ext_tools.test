@@ -1,0 +1,246 @@
+# vsql_mcp — tools that other extensions declare.
+#
+# An extension declares tools with a zero-argument mcp_tools() function. This
+# test builds a small extension, mcp_tooltest, from source into this run's tmp
+# directory, installs it next to vsql_mcp, and asserts:
+#
+#   *  its read tool is listed and callable, and its arguments arrive bound,
+#      not spliced into the SQL;
+#   *  its write tool is hidden and refused while allow_write is OFF, and
+#      listed and callable while it is ON;
+#   *  a manifest that is not JSON, that lacks a field, or that names a handler
+#      the extension does not register drops that extension's tools, writes a
+#      warning to the error log, and leaves the built-in tools alone;
+#   *  UNINSTALL EXTENSION removes the tools.
+#
+# mcp_tooltest's set_manifest() swaps in a broken manifest and set_manifest(NULL)
+# restores the good one, so one build covers every case.
+
+--source mcp_env.inc
+--source mcp_client.inc
+
+--let $ext_src = $MYSQLTEST_VARDIR/tmp/mcp_tooltest
+--mkdir $ext_src
+--mkdir $ext_src/src
+
+--write_file $ext_src/Cargo.toml
+[workspace]
+
+[package]
+name = "mcp_tooltest"
+version = "0.0.1"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+villagesql = "0.0.6"
+EOF
+
+--write_file $ext_src/manifest.json
+{
+  "name": "mcp_tooltest",
+  "version": "0.0.1",
+  "description": "Declares MCP tools for the vsql_mcp test suite",
+  "author": "VillageSQL",
+  "license": "GPL-2.0"
+}
+EOF
+
+--write_file $ext_src/src/lib.rs
+use std::sync::Mutex;
+
+use villagesql::{InValue, VdfReturn};
+
+static MANIFEST: Mutex<Option<String>> = Mutex::new(None);
+
+const GOOD: &str = r#"[
+  {"name": "echo", "description": "Return the arguments.",
+   "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}},
+   "handler": "echo_args", "kind": "read"},
+  {"name": "stamp", "description": "A write tool.",
+   "inputSchema": {"type": "object"},
+   "handler": "stamp", "kind": "write"}
+]"#;
+
+fn arg(args: &[InValue]) -> String {
+    match args.first() {
+        Some(InValue::String(s)) => (*s).to_owned(),
+        _ => "NULL".to_owned(),
+    }
+}
+
+fn mcp_tools(_args: &[InValue]) -> VdfReturn {
+    let manifest = MANIFEST.lock().unwrap_or_else(|e| e.into_inner());
+    VdfReturn::string(manifest.clone().unwrap_or_else(|| GOOD.to_owned()))
+}
+
+fn set_manifest(args: &[InValue]) -> VdfReturn {
+    let mut manifest = MANIFEST.lock().unwrap_or_else(|e| e.into_inner());
+    *manifest = match args.first() {
+        Some(InValue::String(s)) => Some((*s).to_owned()),
+        _ => None,
+    };
+    VdfReturn::int(1)
+}
+
+fn echo_args(args: &[InValue]) -> VdfReturn {
+    let text = arg(args);
+    if text.contains(r#""fail""#) {
+        return VdfReturn::error("asked to fail");
+    }
+    if text.contains(r#""warn""#) {
+        return VdfReturn::warning("asked to warn");
+    }
+    VdfReturn::string(format!("echo:{text}"))
+}
+
+fn stamp(args: &[InValue]) -> VdfReturn {
+    VdfReturn::string(format!("stamped:{}", arg(args)))
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(mcp_tools, "mcp_tools", [] -> villagesql::Type::String, buffer_size: 4096),
+        villagesql::func!(set_manifest, "set_manifest", [villagesql::Type::String] -> villagesql::Type::Int),
+        villagesql::func!(echo_args, "echo_args", [villagesql::Type::String] -> villagesql::Type::String, buffer_size: 1024),
+        villagesql::func!(stamp, "stamp", [villagesql::Type::String] -> villagesql::Type::String, buffer_size: 1024),
+    ],
+}
+EOF
+
+# The build output goes to a log, not the result file: cargo's progress lines
+# vary per run. On a failure the log is in the run's tmp directory.
+--exec cd $ext_src && cargo vsql package > $MYSQLTEST_VARDIR/tmp/mcp_tooltest_build.log 2>&1
+--let $veb_dir = `SELECT @@veb_dir`
+# MTR copies every bundle from the build tree into veb_dir, so a copy built
+# there earlier would block this one.
+--remove_files_wildcard $veb_dir mcp_tooltest.veb
+--copy_file $ext_src/dist/mcp_tooltest.veb $veb_dir/mcp_tooltest.veb
+INSTALL EXTENSION mcp_tooltest;
+
+--write_file $MYSQLTEST_VARDIR/tmp/mcp_ext.py
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import mcp_client as C
+
+C.configure(sys.argv[2])
+MODE = sys.argv[3]
+
+BUILTIN = {"list_schemas", "list_tables", "describe_table", "query", "explain"}
+
+
+def names(sid):
+    _, body, _ = C.rpc(sid, "tools/list")
+    return {t["name"] for t in body["result"]["tools"]}
+
+
+sid = C.init()
+
+if MODE == "write_off":
+    listed = names(sid)
+    C.ok("read_tool_listed", "mcp_tooltest__echo" in listed, sorted(listed))
+    C.ok("write_tool_hidden", "mcp_tooltest__stamp" not in listed, sorted(listed))
+    C.ok("builtins_listed", BUILTIN <= listed, sorted(listed))
+
+    # Quotes and a statement terminator: spliced into the SQL they would break
+    # it or run a second statement; bound, they arrive as one string.
+    args = {"text": "it's \"x\"'); DROP TABLE mcpsec.t1; -- \\ done"}
+    text, err = C.tool(sid, "mcp_tooltest__echo", args)
+    got = json.loads(text[len("echo:"):]) if text and text.startswith("echo:") else None
+    C.ok("read_tool_args_bound", got == args, text or err)
+
+    text, err = C.tool(sid, "mcp_tooltest__echo", None)
+    C.ok("read_tool_no_args", text == "echo:{}", text or err)
+
+    # A handler's error reaches the agent as the server's own sentence.
+    _, err = C.tool(sid, "mcp_tooltest__echo", {"text": "fail"})
+    C.ok("read_tool_error_text",
+         err == "ERROR 3200 (HY000): VDF error in function 'echo_args': asked to fail", err)
+
+    # A handler that returns NULL (as a warning does) is a failed call.
+    _, err = C.tool(sid, "mcp_tooltest__echo", {"text": "warn"})
+    C.rejected("read_tool_null_refused", err, "returned NULL")
+
+    # The extension part of a tool name is client text. A backslash and a
+    # quote in it would end a string literal early if it reached the SQL.
+    _, err = C.tool(sid, "x\\'__echo", {})
+    C.rejected("quoted_name_unknown", err, "unknown tool")
+
+    _, err = C.tool(sid, "mcp_tooltest__stamp", {})
+    C.rejected("write_tool_refused", err, "allow_write")
+
+elif MODE == "write_on":
+    C.ok("write_tool_listed", "mcp_tooltest__stamp" in names(sid))
+    text, err = C.tool(sid, "mcp_tooltest__stamp", {"n": 1})
+    C.ok("write_tool_runs", text == 'stamped:{"n":1}', text or err)
+
+elif MODE == "broken":
+    # Each broken manifest drops every mcp_tooltest tool, including the ones
+    # it still declares correctly, and leaves the built-in tools listed.
+    listed = names(sid)
+    C.ok("broken_tools_dropped",
+         not any(n.startswith("mcp_tooltest__") for n in listed), sorted(listed))
+    C.ok("broken_builtins_listed", BUILTIN <= listed, sorted(listed))
+    _, err = C.tool(sid, "mcp_tooltest__echo", {"text": "x"})
+    C.rejected("broken_call_refused", err, "unknown tool")
+
+elif MODE == "uninstalled":
+    listed = names(sid)
+    C.ok("uninstalled_tools_gone",
+         not any(n.startswith("mcp_tooltest__") for n in listed), sorted(listed))
+    _, err = C.tool(sid, "mcp_tooltest__echo", {"text": "x"})
+    C.rejected("uninstalled_call_refused", err, "unknown tool")
+EOF
+
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_ext.py $MYSQLTEST_VARDIR/tmp $mcp_port write_off
+
+SET GLOBAL vsql_mcp.allow_write = ON;
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_ext.py $MYSQLTEST_VARDIR/tmp $mcp_port write_on
+SET GLOBAL vsql_mcp.allow_write = OFF;
+
+--let SEARCH_FILE = $MYSQLTEST_VARDIR/log/mysqld.1.err
+
+--echo # The quoted tool name above never reached the registration query.
+--let SEARCH_PATTERN = could not read extension registrations
+--source include/search_pattern.inc
+
+--echo # Not JSON.
+SELECT mcp_tooltest.set_manifest('not json');
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_ext.py $MYSQLTEST_VARDIR/tmp $mcp_port broken
+--let SEARCH_PATTERN = ignoring the MCP tools of extension 'mcp_tooltest': mcp_tools\(\) did not return a JSON array
+--source include/search_pattern.inc
+
+--echo # A tool with no handler.
+SELECT mcp_tooltest.set_manifest('[{"name": "echo", "description": "d", "inputSchema": {"type": "object"}, "handler": "echo_args", "kind": "read"}, {"name": "nohandler", "description": "d", "inputSchema": {"type": "object"}, "kind": "read"}]');
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_ext.py $MYSQLTEST_VARDIR/tmp $mcp_port broken
+--let SEARCH_PATTERN = ignoring the MCP tools of extension 'mcp_tooltest': a tool has no string field "handler"
+--source include/search_pattern.inc
+
+--echo # A handler that another extension, vsql_mcp, registers.
+SELECT mcp_tooltest.set_manifest('[{"name": "echo", "description": "d", "inputSchema": {"type": "object"}, "handler": "info", "kind": "read"}]');
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_ext.py $MYSQLTEST_VARDIR/tmp $mcp_port broken
+--let SEARCH_PATTERN = handler 'info' is not a function extension 'mcp_tooltest' registers
+--source include/search_pattern.inc
+
+--echo # A kind that is neither read nor write.
+SELECT mcp_tooltest.set_manifest('[{"name": "echo", "description": "d", "inputSchema": {"type": "object"}, "handler": "echo_args", "kind": "admin"}]');
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_ext.py $MYSQLTEST_VARDIR/tmp $mcp_port broken
+--let SEARCH_PATTERN = kind 'admin' is not 'read' or 'write'
+--source include/search_pattern.inc
+
+SELECT mcp_tooltest.set_manifest(NULL);
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_ext.py $MYSQLTEST_VARDIR/tmp $mcp_port write_off
+
+UNINSTALL EXTENSION mcp_tooltest;
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_ext.py $MYSQLTEST_VARDIR/tmp $mcp_port uninstalled
+
+--remove_file $veb_dir/mcp_tooltest.veb
+--force-rmdir $ext_src
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_tooltest_build.log
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_ext.py
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_client.py
+--source mcp_env_cleanup.inc

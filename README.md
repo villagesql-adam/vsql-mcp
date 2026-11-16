@@ -166,13 +166,14 @@ front of the endpoint.
 
 ## How queries run
 
-Three of the seven tools — `list_schemas`, `list_tables`, and `describe_table` —
+Three of the seven built-in tools — `list_schemas`, `list_tables`, and `describe_table` —
 plus the `vsql://<schema>` resource listing run in-process, via the
 `sql_query` capability. Their column layout is fixed in the extension's own
 code, so no round trip is needed to name or type a result.
 
-Everything else — the `query` tool's arbitrary SQL, the `write` and `ddl` tools, EXPLAIN,
-and `SHOW CREATE TABLE` (behind the `vsql://<schema>/<table>` resource) — runs
+Everything else — the `query` tool's arbitrary SQL, the `write` and `ddl` tools,
+the tools other extensions declare, EXPLAIN, and `SHOW CREATE TABLE` (behind the
+`vsql://<schema>/<table>` resource) — runs
 through a **loopback client connection** to the server, configured by
 `vsql_mcp.db_url`. `sql_query` cannot host these: as of this SDK version it
 reports no column names or types at all, so it cannot label an arbitrary
@@ -216,7 +217,9 @@ Port and TLS changes take effect when the server is next enabled — toggle
 
 ## Tools
 
-The server advertises seven tools via `tools/list`:
+The server advertises seven built-in tools via `tools/list`, followed by the
+tools that installed extensions declare (see
+[Tools from other extensions](#tools-from-other-extensions)):
 
 | Tool | Purpose |
 |---|---|
@@ -392,7 +395,9 @@ with `"enabled": false`.
   including one that opens a network connection (`http_get()` and the like) — so
   a read grants the full reach of installed functions, not only table reads.
   When you need hard confinement, put it in the `db_url` account's `GRANT`s, not
-  only in `allowed_tables`.
+  only in `allowed_tables`. The same holds for the
+  [tools other extensions declare](#tools-from-other-extensions): `allowed_tables`
+  and `schema` do not apply to them.
 - **Secrets are visible to privileged users.** `bearer_token` and `db_url` (which
   embeds a password) are global variables readable via `SHOW VARIABLES` by users
   with the privilege.
@@ -486,6 +491,134 @@ The next `tools/list` includes your tool. The reinstall also returns every
 The `mcp_basic`, `mcp_protocol`, and `mcp_security` tests assert the exact tool
 list, so a new tool has to be named in them too. Bump the version in
 `manifest.json` and `Cargo.toml` together for any behavior change.
+
+## Tools from other extensions
+
+Any installed extension can add tools to `tools/list` without a change to
+`vsql_mcp`. The extension registers a function named `mcp_tools` that takes no
+arguments and returns a JSON array. Each element of the array declares one tool:
+
+| Field | Meaning |
+|---|---|
+| `name` | Tool name, unique within the extension. Letters, digits, `_` and `-`; it starts with a letter or digit and does not contain `__` |
+| `description` | Text that the agent reads |
+| `inputSchema` | JSON Schema object for the arguments |
+| `handler` | Name of a function, registered by the same extension, that runs the tool |
+| `kind` | `read` or `write` |
+
+`tools/list` shows each tool as `<extension>__<name>`, so two extensions cannot
+declare the same tool name. Several extensions can each register `mcp_tools`;
+`vsql_mcp` always calls it as `<extension>.mcp_tools()`.
+
+A call to the tool runs `SELECT <extension>.<handler>(?)` over the `db_url`
+connection, so the `db_url` account's `GRANT`s apply. The call arguments are
+bound as one JSON string and are never put into the SQL text. `vsql_mcp` does
+not check the arguments against `inputSchema`, so the handler checks them. The
+function's result is the tool result, as text. An error that the function
+raises is a tool result with `isError: true`, and so is a NULL result, which is
+what a function returns when it raises a warning. Raise an error, not a
+warning, so that the agent reads why the call failed.
+
+The rules:
+
+- `vsql_mcp` reads every manifest again on each `tools/list` and each call.
+  After `UNINSTALL EXTENSION`, the extension's tools are gone.
+- Extension tools need `vsql_mcp.db_url`. While it is not set, no extension
+  tools are listed.
+- A `handler` must be a function that the same extension registers. A manifest
+  that names any other function is refused.
+- A `read` tool runs in the read-only, time-limited session that the `query`
+  tool uses. A `write` tool runs in the session that the `write` tool uses, and
+  is listed and callable only while `vsql_mcp.allow_write` is ON.
+- `kind` is a label that each extension sets for itself. A read-only session
+  stops the statement from writing to tables, but it does not stop side effects
+  inside the extension's function, such as a network call. Install an extension
+  only when you trust what its tools do.
+- When a manifest is not a JSON array, or one of its tools breaks a rule above,
+  `vsql_mcp` drops every tool of that extension and writes one warning to the
+  error log on each `tools/list`. The other tools stay listed:
+
+  ```
+  [vsql_mcp] ignoring the MCP tools of extension 'mcp_tooltest': a tool has no string field "description"
+  ```
+
+- `mcp_tools()` must return the whole array within its `buffer_size`. With the
+  Rust SDK, a longer result fails the call, so the extension's tools are
+  dropped as above.
+
+A complete Rust extension, `vsql_greet`, with one `read` tool. Its
+`Cargo.toml` depends on `villagesql` and `serde_json`:
+
+```rust
+use villagesql::{InValue, VdfReturn};
+
+const TOOLS: &str = r#"[
+  {
+    "name": "greet",
+    "description": "Greet someone by name.",
+    "inputSchema": {
+      "type": "object",
+      "properties": { "name": { "type": "string" } },
+      "required": ["name"]
+    },
+    "handler": "greet",
+    "kind": "read"
+  }
+]"#;
+
+fn mcp_tools(_args: &[InValue]) -> VdfReturn {
+    VdfReturn::string(TOOLS)
+}
+
+// The tool's arguments arrive as one JSON string, such as {"name":"Ada"}.
+fn greet(args: &[InValue]) -> VdfReturn {
+    let Some(InValue::String(text)) = args.first() else {
+        return VdfReturn::error("greet expects its arguments as a JSON string");
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => return VdfReturn::error(format!("arguments are not JSON: {e}")),
+    };
+    match parsed.get("name").and_then(serde_json::Value::as_str) {
+        Some(name) => VdfReturn::string(format!("Hello, {name}!")),
+        None => VdfReturn::error("missing argument: name"),
+    }
+}
+
+villagesql::extension! {
+    funcs: [
+        villagesql::func!(mcp_tools, "mcp_tools", [] -> villagesql::Type::String, buffer_size: 1024),
+        villagesql::func!(greet, "greet", [villagesql::Type::String] -> villagesql::Type::String),
+    ],
+}
+```
+
+After `INSTALL EXTENSION vsql_greet`, `tools/list` includes:
+
+```json
+{
+  "description": "Greet someone by name.",
+  "inputSchema": {
+    "properties": {
+      "name": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "name"
+    ],
+    "type": "object"
+  },
+  "name": "vsql_greet__greet"
+}
+```
+
+A `tools/call` of `vsql_greet__greet` with `{"name": "Ada"}` returns the text
+`Hello, Ada!`. The same call with `{}` returns `isError: true` and the text:
+
+```
+ERROR 3200 (HY000): VDF error in function 'greet': missing argument: name
+```
 
 ## Testing
 

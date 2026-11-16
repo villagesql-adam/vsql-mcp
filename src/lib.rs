@@ -10,6 +10,7 @@
 
 mod config;
 mod executor;
+mod ext_tools;
 mod guardrails;
 mod httpd;
 mod mcp;

@@ -32,6 +32,7 @@ sets this via `mysql-test/t/mcp_basic-master.opt`).
 | `src/httpd.rs` | HTTP transport: listener lifecycle, status codes, auth, Origin, sessions |
 | `src/mcp.rs` | JSON-RPC layer: protocol constants, session store, method dispatch |
 | `src/tools.rs` | The built-in MCP tools |
+| `src/ext_tools.rs` | Tools that other extensions declare with an `mcp_tools()` function |
 | `src/resources.rs` | The `vsql://` resources |
 | `src/guardrails.rs` | Statement classification, schema scoping, table-allowlist checks |
 | `src/executor.rs` | `QueryExecutor` trait + the loopback client implementation |

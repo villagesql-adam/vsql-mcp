@@ -506,6 +506,6 @@ fn read_body(request: Request) -> BodyRead {
     }
 }
 
-fn log(msg: &str) {
+pub(crate) fn log(msg: &str) {
     eprintln!("[vsql_mcp] {msg}");
 }

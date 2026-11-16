@@ -11,13 +11,14 @@ use serde_json::{json, Value as Json};
 use crate::config::RequestConfig;
 use crate::executor::{self, col, QueryExecutor};
 use crate::guardrails::{self, StmtKind};
-use crate::{mcp, status};
+use crate::{ext_tools, mcp, status};
 
-/// The advertised tool list with input schemas. `write` and `ddl` are
+/// The advertised tool list with input schemas: the built-in tools, then the
+/// tools installed extensions declare (see `ext_tools`). `write` and `ddl` are
 /// advertised only when they are usable: a tool an agent can see is one it will
 /// plan around, and discovering the refusal by attempting a mutation is a
 /// wasted turn.
-pub fn list(cfg: &RequestConfig) -> Json {
+pub fn list(cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Json {
     let mut listing = tool_definitions();
     if let Some(tools) = listing["tools"].as_array_mut() {
         tools.retain(|t| match t.get("name").and_then(Json::as_str) {
@@ -27,6 +28,7 @@ pub fn list(cfg: &RequestConfig) -> Json {
             Some("ddl") => cfg.allow_ddl && cfg.allowed_tables.is_empty(),
             _ => true,
         });
+        tools.extend(ext_tools::list(cfg, exec));
     }
     listing
 }
@@ -106,19 +108,21 @@ pub fn call(params: &Json, id: &Json, cfg: &RequestConfig, exec: &dyn QueryExecu
     let name = params.get("name").and_then(Json::as_str).unwrap_or("");
     let args = params.get("arguments").unwrap_or(&Json::Null);
 
+    // An extension tool's result is the handler's own text, passed through
+    // as-is rather than serialized again as a JSON string.
     let outcome = match name {
-        "list_schemas" => list_schemas(cfg, exec),
-        "list_tables" => list_tables(args, cfg, exec),
-        "describe_table" => describe_table(args, cfg, exec),
-        "query" => query(args, cfg, exec),
-        "explain" => explain(args, cfg, exec),
-        "write" => write(args, cfg, exec),
-        "ddl" => ddl(args, cfg, exec),
-        other => Err(format!("unknown tool: {other}")),
+        "list_schemas" => list_schemas(cfg, exec).map(|v| v.to_string()),
+        "list_tables" => list_tables(args, cfg, exec).map(|v| v.to_string()),
+        "describe_table" => describe_table(args, cfg, exec).map(|v| v.to_string()),
+        "query" => query(args, cfg, exec).map(|v| v.to_string()),
+        "explain" => explain(args, cfg, exec).map(|v| v.to_string()),
+        "write" => write(args, cfg, exec).map(|v| v.to_string()),
+        "ddl" => ddl(args, cfg, exec).map(|v| v.to_string()),
+        _ => ext_tools::call(name, args, cfg, exec),
     };
 
     match outcome {
-        Ok(value) => mcp::result(id, tool_ok(&value)),
+        Ok(text) => mcp::result(id, tool_ok(&text)),
         Err(msg) => {
             status::inc_tool_errors();
             mcp::result(id, tool_err(&msg))
@@ -126,10 +130,10 @@ pub fn call(params: &Json, id: &Json, cfg: &RequestConfig, exec: &dyn QueryExecu
     }
 }
 
-/// A successful tool result: the value serialized as one JSON text block.
-fn tool_ok(value: &Json) -> Json {
+/// A successful tool result: one text block.
+fn tool_ok(text: &str) -> Json {
     json!({
-        "content": [ { "type": "text", "text": value.to_string() } ],
+        "content": [ { "type": "text", "text": text } ],
         "isError": false
     })
 }
