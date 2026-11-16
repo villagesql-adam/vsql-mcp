@@ -40,6 +40,47 @@ pub fn classify(sql: &str) -> StmtKind {
     }
 }
 
+/// Whether `sql` is one statement of a form the `ddl` tool runs:
+/// `CREATE`/`ALTER`/`DROP`/`RENAME TABLE` or `CREATE`/`DROP INDEX`. Databases,
+/// users, grants, views, stored programs and `TRUNCATE` are not on the list.
+///
+/// Comments are allowed only before the statement. After it starts, a
+/// comment, a double quote or a backslash refuses it: the scanners behind
+/// `has_trailing_statement` and `schema_violation` do not model comments,
+/// backslash escapes or `ANSI_QUOTES`, and a quote inside a comment hid a
+/// `schema.` qualifier from them. A `/*! */` comment refuses it even before
+/// the statement, because the server runs the text inside one.
+pub fn is_allowed_ddl(sql: &str) -> bool {
+    let stripped = strip_leading(sql);
+    if sql.contains("/*!")
+        || ["/*", "#", "--", "\"", "\\"]
+            .iter()
+            .any(|t| stripped.contains(t))
+        || has_trailing_statement(stripped)
+        || mentions_tablespace(stripped)
+    {
+        return false;
+    }
+    let lower = stripped.to_ascii_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().take(3).collect();
+    matches!(
+        words.as_slice(),
+        ["create" | "alter" | "drop" | "rename", "table", ..]
+            | ["create" | "drop", "temporary", "table"]
+            | ["create" | "drop", "index", ..]
+            | ["create", "unique" | "fulltext" | "spatial", "index"]
+    )
+}
+
+/// No migration needs a tablespace clause. `DISCARD` and `IMPORT TABLESPACE`
+/// need files an agent cannot place, and `TABLESPACE = innodb_system` puts a
+/// table in the system tablespace, whose space is never given back.
+fn mentions_tablespace(sql: &str) -> bool {
+    idents_outside_strings(sql)
+        .iter()
+        .any(|w| w.eq_ignore_ascii_case("tablespace"))
+}
+
 /// The statement's leading keyword, lowercased, after leading comments and
 /// whitespace are stripped. Empty when the statement starts with something that
 /// is not a bare word.
@@ -337,6 +378,22 @@ pub fn schema_violation(sql: &str, configured: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The `ddl` tool's form of `schema_violation`: every `x.y` qualifier must name
+/// the configured schema, with no exception for names the statement binds.
+/// That exception lets `t.col` through in a query, but in DDL a qualifier after
+/// a comma or `TO` is a schema that `table_refs` does not see, so in
+/// `DROP TABLE app.secret, secret.salaries` the bound table name `secret` would
+/// have hidden the schema `secret`.
+pub fn ddl_schema_violation(sql: &str, configured: &str) -> Option<String> {
+    if configured.is_empty() {
+        return None;
+    }
+    qualified_refs(sql)
+        .into_iter()
+        .map(|(schema, _table)| schema)
+        .find(|schema| !schema.eq_ignore_ascii_case(configured))
 }
 
 /// Find `<ident>.<ident>` references outside string literals, returning

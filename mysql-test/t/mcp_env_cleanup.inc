@@ -10,6 +10,7 @@ let $wait_condition=
 SET GLOBAL vsql_mcp.schema = '';
 SET GLOBAL vsql_mcp.allowed_tables = '';
 SET GLOBAL vsql_mcp.allow_write = OFF;
+SET GLOBAL vsql_mcp.allow_ddl = OFF;
 SET GLOBAL vsql_mcp.require_auth = OFF;
 SET GLOBAL vsql_mcp.bearer_token = '';
 SET GLOBAL vsql_mcp.max_rows = 1000;

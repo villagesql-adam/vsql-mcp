@@ -72,6 +72,14 @@ pub trait QueryExecutor {
     /// Run a write statement, returning the affected-row count.
     fn write(&self, sql: &str, timeout_s: u64) -> Result<u64, String>;
 
+    /// Run exactly one statement the way `write` does, returning the
+    /// affected-row count. It goes through the prepared-statement protocol,
+    /// which the server parses as a single statement, so text after a `;`
+    /// is a syntax error rather than a second statement. The text protocol
+    /// `write` uses runs every statement it is given: the driver always asks
+    /// for multi-statement support.
+    fn write_one(&self, sql: &str, timeout_s: u64) -> Result<u64, String>;
+
     /// Run a read-only statement with positional parameters, returning all
     /// rows keyed by `columns` — which the caller must give in the exact
     /// order its `sql`'s select list names them, since the native path (see
@@ -233,6 +241,25 @@ impl Loopback<'_> {
             _cancel: Some(cancel),
         }
     }
+
+    /// The body of `write` and `write_one`, which differ only in `prepared`.
+    fn bounded_write(&self, sql: &str, timeout_s: u64, prepared: bool) -> Result<u64, String> {
+        // MAX_EXECUTION_TIME does not apply to INSERT/UPDATE/DELETE, so the
+        // only way to bound a write is to kill it. Give the client read timeout
+        // headroom so the kill is what ends the statement, and the caller gets
+        // a definite answer instead of a dropped socket.
+        let mut conn = self.connect(timeout_s.saturating_add(READ_TIMEOUT_HEADROOM_S))?;
+        let watchdog = self.spawn_kill_watchdog(&mut conn, timeout_s);
+        let outcome = if prepared {
+            conn.exec_drop(sql, ())
+        } else {
+            conn.query_drop(sql)
+        }
+        .map_err(map_write_err);
+        drop(watchdog);
+        outcome?;
+        Ok(conn.affected_rows())
+    }
 }
 
 /// How long the watchdog's own connection may take. Short: it exists only to
@@ -253,16 +280,11 @@ impl QueryExecutor for Loopback<'_> {
     }
 
     fn write(&self, sql: &str, timeout_s: u64) -> Result<u64, String> {
-        // MAX_EXECUTION_TIME does not apply to INSERT/UPDATE/DELETE, so the
-        // only way to bound a write is to kill it. Give the client read timeout
-        // headroom so the kill is what ends the statement, and the caller gets
-        // a definite answer instead of a dropped socket.
-        let mut conn = self.connect(timeout_s.saturating_add(READ_TIMEOUT_HEADROOM_S))?;
-        let watchdog = self.spawn_kill_watchdog(&mut conn, timeout_s);
-        let outcome = conn.query_drop(sql).map_err(map_write_err);
-        drop(watchdog);
-        outcome?;
-        Ok(conn.affected_rows())
+        self.bounded_write(sql, timeout_s, false)
+    }
+
+    fn write_one(&self, sql: &str, timeout_s: u64) -> Result<u64, String> {
+        self.bounded_write(sql, timeout_s, true)
     }
 
     fn read_params(
@@ -637,6 +659,10 @@ impl QueryExecutor for Hybrid<'_> {
 
     fn write(&self, sql: &str, timeout_s: u64) -> Result<u64, String> {
         self.loopback.write(sql, timeout_s)
+    }
+
+    fn write_one(&self, sql: &str, timeout_s: u64) -> Result<u64, String> {
+        self.loopback.write_one(sql, timeout_s)
     }
 
     fn read_params(

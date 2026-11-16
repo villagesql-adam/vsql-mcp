@@ -1,0 +1,153 @@
+# vsql_mcp — the ddl tool.
+#
+# Asserts that ddl is hidden and refused while allow_ddl is OFF; that with it ON
+# the accepted forms run as the db_url account, so its grants decide where;
+# that every other statement is refused, including forms that hide a second
+# statement in a comment; and that schema scoping and the table allowlist hold.
+
+--source mcp_env.inc
+--source mcp_client.inc
+
+# DDL grants on mcpsec only, so a statement against mcpalt reaches the server
+# and is refused by the account's grants.
+GRANT CREATE, ALTER, DROP, INDEX, CREATE TEMPORARY TABLES ON mcpsec.* TO mcpuser@'127.0.0.1';
+
+--write_file $MYSQLTEST_VARDIR/tmp/mcp_ddl.py
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import mcp_client as C
+
+C.configure(sys.argv[2])
+MODE = sys.argv[3]
+
+REJECT_FORM = "the ddl tool accepts a single"
+
+
+def names(sid):
+    _, body, _ = C.rpc(sid, "tools/list")
+    return {t["name"] for t in body["result"]["tools"]}
+
+
+def ddl(sid, sql):
+    return C.tool(sid, "ddl", {"sql": sql})
+
+
+sid = C.init()
+
+if MODE == "off":
+    C.ok("off_hidden", "ddl" not in names(sid))
+    _, err = ddl(sid, "CREATE TABLE mcpsec.off1 (id INT)")
+    C.rejected("off_refused", err, "allow_ddl")
+
+elif MODE == "on":
+    C.ok("on_listed", "ddl" in names(sid))
+    for label, sql in [
+        ("create_table", "CREATE TABLE mcpsec.d1 (id INT PRIMARY KEY)"),
+        ("alter_table", "ALTER TABLE mcpsec.d1 ADD COLUMN name VARCHAR(20)"),
+        ("create_index", "CREATE INDEX ix_name ON mcpsec.d1 (name)"),
+        ("create_unique_index", "create unique index ux_name on mcpsec.d1 (name)"),
+        ("drop_index", "DROP INDEX ix_name ON mcpsec.d1"),
+        ("rename_table", "RENAME TABLE mcpsec.d1 TO mcpsec.d2"),
+        ("create_temporary", "CREATE TEMPORARY TABLE mcpsec.tmp1 (i INT)"),
+        ("leading_comment", "-- migration 1\nCREATE TABLE mcpsec.d3 (i INT)"),
+        ("drop_table", "DROP TABLE mcpsec.d3"),
+    ]:
+        text, err = ddl(sid, sql)
+        C.ok(label, text is not None, err)
+
+    # The tool refuses these before they reach the server.
+    for label, sql in [
+        ("refuse_drop_database", "DROP DATABASE mcpalt"),
+        ("refuse_create_database", "CREATE DATABASE mcpnew"),
+        ("refuse_create_user", "CREATE USER x@localhost"),
+        ("refuse_grant", "GRANT ALL ON *.* TO mcpuser@'127.0.0.1'"),
+        ("refuse_create_view", "CREATE VIEW mcpsec.v1 AS SELECT 1"),
+        ("refuse_create_procedure", "CREATE PROCEDURE mcpsec.p() SELECT 1"),
+        ("refuse_truncate", "TRUNCATE TABLE mcpsec.t1"),
+        ("refuse_insert", "INSERT INTO mcpsec.t1 VALUES (9, 'x')"),
+        ("refuse_select", "SELECT 1"),
+        ("refuse_two_statements", "CREATE TABLE mcpsec.m1 (i INT); DROP TABLE mcpsec.t1"),
+        ("refuse_comment_between_words", "DROP /* x */ DATABASE mcpalt"),
+        ("refuse_version_comment",
+         "/*!80000 DROP TABLE mcpsec.secret; */ CREATE TABLE mcpsec.m2 (i INT)"),
+        ("refuse_inner_version_comment",
+         "CREATE TABLE mcpsec.m3 (i INT) /*!80000 ; DROP TABLE mcpsec.secret */"),
+        # A quote inside a comment, or after a backslash, used to hide the ;
+        # from the classifier, and the server then ran the second statement.
+        ("refuse_dash_comment_quote",
+         "CREATE TABLE mcpsec.h1 (i INT) -- '\n; DROP TABLE mcpsec.secret; -- '"),
+        ("refuse_hash_comment_quote",
+         "CREATE TABLE mcpsec.h2 (i INT) # '\n; DROP TABLE mcpsec.secret; # '"),
+        ("refuse_discard_tablespace", "ALTER TABLE mcpsec.t1 DISCARD TABLESPACE"),
+        ("refuse_import_tablespace", "alter table mcpsec.t1 import tablespace"),
+        ("refuse_system_tablespace",
+         "CREATE TABLE mcpsec.ts1 (i INT) TABLESPACE=innodb_system"),
+        ("refuse_backslash_quote",
+         "CREATE TABLE mcpsec.h3 (c VARCHAR(5) DEFAULT '\\''); DROP TABLE mcpsec.secret; -- '"),
+    ]:
+        _, err = ddl(sid, sql)
+        C.rejected(label, err, REJECT_FORM)
+
+    # Accepted by the tool, refused by the db_url account's grants.
+    _, err = ddl(sid, "CREATE TABLE mcpalt.g1 (i INT)")
+    C.rejected("grants_apply", err, "command denied")
+
+elif MODE == "schema":
+    text, err = ddl(sid, "CREATE TABLE mcpsec.mcpalt (i INT)")
+    C.ok("schema_decoy_created", text is not None, err)
+    for label, sql in [
+        ("schema_alter_other", "ALTER TABLE mcpalt.t1 ADD COLUMN z INT"),
+        ("schema_rename_out", "RENAME TABLE mcpsec.d2 TO mcpalt.d2"),
+        ("schema_foreign_key",
+         "CREATE TABLE mcpsec.fk1 (id INT, FOREIGN KEY (id) REFERENCES mcpalt.t1 (id))"),
+        # A table in the exposed schema named like the other schema used to
+        # hide that schema's qualifier after a comma or TO.
+        ("schema_decoy_drop", "DROP TABLE mcpsec.mcpalt, mcpalt.t1"),
+        ("schema_decoy_rename",
+         "RENAME TABLE mcpsec.mcpalt TO mcpsec.m9, mcpalt.t1 TO mcpsec.t9"),
+        ("schema_decoy_select",
+         "CREATE TABLE mcpsec.mcpalt SELECT * FROM mcpsec.t1, mcpalt.t1"),
+    ]:
+        _, err = ddl(sid, sql)
+        C.rejected(label, err, "outside the exposed schema")
+    # A quote inside a comment used to hide the other schema's name from the
+    # scoping check; a double-quoted name is one under ANSI_QUOTES.
+    for label, sql in [
+        ("schema_rename_comment", "RENAME TABLE mcpsec.d2 TO /* ' */ mcpalt.d2 /* ' */"),
+        ("schema_double_quotes", 'CREATE TABLE "mcpalt"."x" (i INT)'),
+    ]:
+        _, err = ddl(sid, sql)
+        C.rejected(label, err, REJECT_FORM)
+    text, err = ddl(sid, "DROP TABLE mcpsec.d2, mcpsec.mcpalt")
+    C.ok("schema_inside_runs", text is not None, err)
+
+elif MODE == "allowlist":
+    C.ok("allowlist_hidden", "ddl" not in names(sid))
+    _, err = ddl(sid, "CREATE TABLE mcpsec.al1 (i INT)")
+    C.rejected("allowlist_refused", err, "allowed_tables")
+EOF
+
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_ddl.py $MYSQLTEST_VARDIR/tmp $mcp_port off
+
+SET GLOBAL vsql_mcp.allow_ddl = ON;
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_ddl.py $MYSQLTEST_VARDIR/tmp $mcp_port on
+SHOW CREATE TABLE mcpsec.d2;
+--echo # The tables the refused statements name are unchanged.
+SELECT TABLE_NAME FROM information_schema.TABLES
+ WHERE TABLE_SCHEMA IN ('mcpsec', 'mcpalt') ORDER BY TABLE_SCHEMA, TABLE_NAME;
+
+SET GLOBAL vsql_mcp.schema = 'mcpsec';
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_ddl.py $MYSQLTEST_VARDIR/tmp $mcp_port schema
+SET GLOBAL vsql_mcp.schema = '';
+
+SET GLOBAL vsql_mcp.allowed_tables = 't1';
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_ddl.py $MYSQLTEST_VARDIR/tmp $mcp_port allowlist
+SET GLOBAL vsql_mcp.allowed_tables = '';
+
+SELECT TABLE_NAME FROM information_schema.TABLES
+ WHERE TABLE_SCHEMA IN ('mcpsec', 'mcpalt') ORDER BY TABLE_SCHEMA, TABLE_NAME;
+
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_ddl.py
+--remove_file $MYSQLTEST_VARDIR/tmp/mcp_client.py
+--source mcp_env_cleanup.inc
