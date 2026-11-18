@@ -251,10 +251,12 @@ Applied to every `query`, `explain`, and `write` call:
   `db_url` an account whose grants match the blast radius you are willing to
   accept.
 - **Schema scoping.** With `schema` set, a reference to any other schema is
-  rejected. Table names must be qualified with the exposed schema
-  (`mydb.orders`): the loopback connection has no default database, so a bare
-  name does not resolve. Aliases and table-qualified columns work normally —
-  `p.total` is a column, not a schema.
+  rejected. The exposed schema is the loopback connection's default database,
+  so a bare table name such as `orders` resolves inside it, and any database
+  named in `db_url` is ignored. If the schema does not exist, the `query`,
+  `explain`, and `write` tools fail with
+  `vsql_mcp.schema 'mydb' does not exist`. Aliases and table-qualified columns
+  work normally — `p.total` is a column, not a schema.
 
   A `SHOW` statement with `FROM` or `IN`, `SHOW CREATE DATABASE`, and a `SHOW`
   statement that lists every schema (`SHOW DATABASES`, `SHOW OPEN TABLES`) are
