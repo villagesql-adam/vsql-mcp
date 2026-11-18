@@ -16,7 +16,7 @@ use mysql::Value as MyValue;
 use serde_json::{json, Value as Json};
 
 use crate::config::RequestConfig;
-use crate::executor::{col, QueryExecutor};
+use crate::executor::Loopback;
 use crate::httpd::log;
 use crate::resources::quote_ident;
 
@@ -53,7 +53,7 @@ impl ExtTool {
 
 /// The extension tools an agent may see. A `write` tool is left out while
 /// `allow_write` is OFF, for the same reason the built-in `write` tool is.
-pub fn list(cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Vec<Json> {
+pub fn list(cfg: &RequestConfig, exec: &Loopback) -> Vec<Json> {
     discover(None, cfg, exec)
         .iter()
         .filter(|t| cfg.allow_write || !t.write)
@@ -67,7 +67,7 @@ pub fn call(
     name: &str,
     args: &Json,
     cfg: &RequestConfig,
-    exec: &dyn QueryExecutor,
+    exec: &Loopback,
 ) -> Result<String, String> {
     let unknown = || format!("unknown tool: {name}");
     let (extension, _) = name.rsplit_once(SEP).ok_or_else(unknown)?;
@@ -113,21 +113,17 @@ pub fn call(
 /// `only`. An extension whose manifest cannot be read or is invalid adds no
 /// tools, and one warning naming it goes to the error log; the other
 /// extensions' tools are unaffected.
-fn discover(only: Option<&str>, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Vec<ExtTool> {
+fn discover(only: Option<&str>, cfg: &RequestConfig, exec: &Loopback) -> Vec<ExtTool> {
     // Every manifest and handler call needs the db_url connection; without it
     // there is nothing to offer, and a warning per extension would only repeat
     // what an unset db_url already says.
     if cfg.db_url.trim().is_empty() {
         return Vec::new();
     }
-    // `only` comes from the tool name the client sent, so it is matched here
-    // rather than passed to the query: `read_params` may splice its parameters
-    // into the SQL text on the in-process path.
     let rows = exec.read_params(
         "SELECT EXTENSION_NAME, REGISTRATION_JSON FROM INFORMATION_SCHEMA.EXTENSION_REGISTRATION \
          ORDER BY EXTENSION_NAME",
         vec![],
-        &[col("EXTENSION_NAME"), col("REGISTRATION_JSON")],
         cfg.query_timeout,
     );
     let rows = match rows {
@@ -188,7 +184,7 @@ fn read_manifest(
     extension: &str,
     funcs: &[String],
     cfg: &RequestConfig,
-    exec: &dyn QueryExecutor,
+    exec: &Loopback,
 ) -> Result<Vec<ExtTool>, String> {
     let sql = format!(
         "SELECT {}.{MANIFEST_FN}() AS manifest",

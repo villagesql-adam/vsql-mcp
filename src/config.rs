@@ -16,7 +16,6 @@ extern "C" {
 const COMPONENT: &CStr = c"vsql_mcp";
 
 const DEFAULT_PORT: i64 = 3100;
-const DEFAULT_SSL_PORT: i64 = 3143;
 const DEFAULT_MAX_ROWS: i64 = 1000;
 const DEFAULT_QUERY_TIMEOUT: i64 = 30;
 const DEFAULT_SESSION_TTL: i64 = 1800;
@@ -25,10 +24,7 @@ const DEFAULT_SESSION_TTL: i64 = 1800;
 /// `thread_worker` capability owns that control variable.
 static SPECS: &[SysVarSpec] = &[
     SysVarSpec::Int { name: c"port", comment: c"HTTP listen port (0 = OS-assigned)", default: DEFAULT_PORT, min: 0, max: 65535, on_change: None },
-    SysVarSpec::Int { name: c"ssl_port", comment: c"HTTPS listen port (0 = OS-assigned)", default: DEFAULT_SSL_PORT, min: 0, max: 65535, on_change: None },
-    SysVarSpec::Str { name: c"ssl_cert", comment: c"Path to the TLS certificate (PEM)", default: c"", on_change: None },
-    SysVarSpec::Str { name: c"ssl_key", comment: c"Path to the TLS private key (PEM)", default: c"", on_change: None },
-    SysVarSpec::Str { name: c"schema", comment: c"Schema to expose (empty = all non-system schemas)", default: c"", on_change: None },
+    SysVarSpec::Str { name: c"schema", comment: c"Schema to expose (empty = every schema the db_url account can see)", default: c"", on_change: None },
     SysVarSpec::Bool { name: c"require_auth", comment: c"Require a bearer token on every request", default: false, on_change: None },
     SysVarSpec::Str { name: c"bearer_token", comment: c"Static bearer token when require_auth is ON", default: c"", on_change: None },
     SysVarSpec::Bool { name: c"allow_write", comment: c"Enable the write tool (INSERT/UPDATE/DELETE)", default: false, on_change: None },
@@ -93,27 +89,6 @@ fn get_bool(name: &CStr) -> bool {
     }
 }
 
-/// The listener-only settings, read once when the worker binds. Keeping these
-/// out of `RequestConfig` means a per-request read doesn't fetch four sys vars
-/// it never uses.
-pub struct ListenConfig {
-    pub port: i64,
-    pub ssl_port: i64,
-    pub ssl_cert: String,
-    pub ssl_key: String,
-}
-
-impl ListenConfig {
-    pub fn read() -> Self {
-        Self {
-            port: get_int(c"port", DEFAULT_PORT),
-            ssl_port: get_int(c"ssl_port", DEFAULT_SSL_PORT),
-            ssl_cert: get_str(c"ssl_cert"),
-            ssl_key: get_str(c"ssl_key"),
-        }
-    }
-}
-
 /// The settings a single request needs, read once at the start of handling it.
 /// Values are stored in the type each consumer wants, converted here where the
 /// sys-var bounds already guarantee the conversion is lossless.
@@ -165,12 +140,13 @@ pub fn auth_settings() -> (bool, String) {
 pub fn schema_setting() -> String {
     get_str(c"schema")
 }
-pub fn port_settings() -> (i64, i64) {
-    (get_int(c"port", DEFAULT_PORT), get_int(c"ssl_port", DEFAULT_SSL_PORT))
+pub fn port() -> i64 {
+    get_int(c"port", DEFAULT_PORT)
 }
 
-/// How long an idle session stays valid. Read per use rather than cached so a
-/// change applies to the next request, like every other setting here.
+/// How long an idle session stays valid. MCP clients are supposed to DELETE a
+/// session on exit but often don't, so this bounds the session map. Read per
+/// use rather than cached so a change applies to the next request.
 pub fn session_ttl() -> std::time::Duration {
     // session_ttl has SPECS min 1 and a >= 1 fallback, so it is always positive.
     std::time::Duration::from_secs(get_int(c"session_ttl", DEFAULT_SESSION_TTL) as u64)

@@ -1,6 +1,7 @@
 INSTALL EXTENSION vsql_mcp;
 CREATE USER mcpuser@'127.0.0.1';
-GRANT SELECT, SHOW VIEW ON *.* TO mcpuser@'127.0.0.1';
+GRANT SELECT, SHOW VIEW ON mcpsec.* TO mcpuser@'127.0.0.1';
+GRANT SELECT, SHOW VIEW ON mcpalt.* TO mcpuser@'127.0.0.1';
 CREATE SCHEMA mcpsec;
 GRANT INSERT, UPDATE, DELETE ON mcpsec.* TO mcpuser@'127.0.0.1';
 CREATE TABLE mcpsec.t1 (id INT PRIMARY KEY, name VARCHAR(50));
@@ -70,6 +71,8 @@ SET GLOBAL vsql_mcp.schema = 'mcpsec';
 schema_decoy_created: PASS
 schema_alter_other: PASS
 schema_rename_out: PASS
+schema_digit_prefix: PASS
+schema_dollar_prefix: PASS
 schema_foreign_key: PASS
 schema_decoy_drop: PASS
 schema_decoy_rename: PASS
@@ -101,9 +104,6 @@ SET GLOBAL vsql_mcp.max_rows = 1000;
 SET GLOBAL vsql_mcp.query_timeout = 30;
 SET GLOBAL vsql_mcp.session_ttl = 1800;
 SET GLOBAL vsql_mcp.db_url = '';
-SET GLOBAL vsql_mcp.ssl_cert = '';
-SET GLOBAL vsql_mcp.ssl_key = '';
-SET GLOBAL vsql_mcp.ssl_port = 3143;
 DROP VIEW mcpsec.v_secret;
 DROP VIEW mcpsec.v_leak;
 DROP SCHEMA mcpalt;

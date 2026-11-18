@@ -14,7 +14,6 @@ static TOOL_ERRORS_TOTAL: AtomicI64 = AtomicI64::new(0);
 static SESSIONS_ACTIVE: AtomicI64 = AtomicI64::new(0);
 static ROWS_RETURNED_TOTAL: AtomicI64 = AtomicI64::new(0);
 static HTTP_PORT: AtomicI64 = AtomicI64::new(0);
-static HTTPS_PORT: AtomicI64 = AtomicI64::new(0);
 
 /// Declared to the server, which prefixes each name with the component, so
 /// these surface as `vsql_mcp.tool_calls_total` etc. under
@@ -25,7 +24,6 @@ static SPECS: &[StatusVarSpec] = &[
     StatusVarSpec::Int { name: c"sessions_active", value: &SESSIONS_ACTIVE },
     StatusVarSpec::Int { name: c"rows_returned_total", value: &ROWS_RETURNED_TOTAL },
     StatusVarSpec::Int { name: c"http_port", value: &HTTP_PORT },
-    StatusVarSpec::Int { name: c"https_port", value: &HTTPS_PORT },
 ];
 
 pub static STATUS_VAR: StatusVarCapability = StatusVarCapability::new(SPECS);
@@ -54,14 +52,6 @@ pub fn set_http_port(port: i64) {
     HTTP_PORT.store(port, Ordering::Relaxed);
 }
 
-pub fn set_https_port(port: i64) {
-    HTTPS_PORT.store(port, Ordering::Relaxed);
-}
-
 pub fn http_port() -> i64 {
     HTTP_PORT.load(Ordering::Relaxed)
-}
-
-pub fn https_port() -> i64 {
-    HTTPS_PORT.load(Ordering::Relaxed)
 }

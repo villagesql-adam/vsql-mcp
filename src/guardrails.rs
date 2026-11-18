@@ -1,8 +1,9 @@
-//! Statement-level safety checks applied before any tool query runs.
+//! Statement checks applied before a tool query runs.
 //!
-//! These are defense in depth, not the only line: the loopback executor also
-//! opens a read-only session for the read tools. The checks here give a clear,
-//! MCP-level rejection before a statement reaches the server.
+//! They pick the tool and the session a statement runs in, and give an agent a
+//! clear refusal. They are not the limit on what an agent can reach: the
+//! `db_url` account's grants are, along with the read-only session and the
+//! one-statement-per-call prepared protocol in `executor`.
 
 use serde_json::Value as Json;
 
@@ -18,19 +19,15 @@ pub enum StmtKind {
 const READ_VERBS: &[&str] = &["select", "show", "describe", "desc", "explain", "with"];
 const WRITE_VERBS: &[&str] = &["insert", "update", "delete", "replace"];
 
-/// Classify a single SQL statement by its leading keyword, after stripping
-/// leading comments and whitespace. A trailing second statement (a `;` with
+/// Classify a single SQL statement by its leading keyword, as the server reads
+/// it: leading comments are skipped, and the text of an executable comment counts.
+/// A statement the server may read in more than one way is `Disallowed`. A trailing second statement (a `;` with
 /// non-whitespace after it) forces `Disallowed` — one statement per tool call.
 pub fn classify(sql: &str) -> StmtKind {
-    let stripped = strip_leading(sql);
-    let first = stripped
-        .split(|c: char| c.is_whitespace() || c == '(')
-        .next()
-        .unwrap_or("");
-
-    if has_trailing_statement(stripped) {
+    if has_trailing_statement(sql) || tokens(sql).contains(&Tok::Unclear) {
         return StmtKind::Disallowed;
     }
+    let first = leading_verb(sql);
     if READ_VERBS.iter().any(|v| first.eq_ignore_ascii_case(v)) {
         StmtKind::Read
     } else if WRITE_VERBS.iter().any(|v| first.eq_ignore_ascii_case(v)) {
@@ -45,11 +42,10 @@ pub fn classify(sql: &str) -> StmtKind {
 /// users, grants, views, stored programs and `TRUNCATE` are not on the list.
 ///
 /// Comments are allowed only before the statement. After it starts, a
-/// comment, a double quote or a backslash refuses it: the scanners behind
-/// `has_trailing_statement` and `schema_violation` do not model comments,
-/// backslash escapes or `ANSI_QUOTES`, and a quote inside a comment hid a
-/// `schema.` qualifier from them. A `/*! */` comment refuses it even before
-/// the statement, because the server runs the text inside one.
+/// comment, a double quote or a backslash refuses it: no migration needs them,
+/// and `ANSI_QUOTES` makes a double-quoted name an identifier the scanners read
+/// as a string. A `/*! */` comment refuses it even before the statement,
+/// because the server runs the text inside one.
 pub fn is_allowed_ddl(sql: &str) -> bool {
     let stripped = strip_leading(sql);
     if sql.contains("/*!")
@@ -81,15 +77,13 @@ fn mentions_tablespace(sql: &str) -> bool {
         .any(|w| w.eq_ignore_ascii_case("tablespace"))
 }
 
-/// The statement's leading keyword, lowercased, after leading comments and
-/// whitespace are stripped. Empty when the statement starts with something that
-/// is not a bare word.
+/// The statement's leading keyword, lowercased. Empty when the statement
+/// starts with something that is not a bare word.
 pub fn leading_verb(sql: &str) -> String {
-    strip_leading(sql)
-        .split(|c: char| c.is_whitespace() || c == '(')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase()
+    match tokens(sql).first() {
+        Some(Tok::Word { text, quoted: false }) => text.to_ascii_lowercase(),
+        _ => String::new(),
+    }
 }
 
 /// The file-writing target of a `SELECT ... INTO OUTFILE`/`INTO DUMPFILE`, if
@@ -137,7 +131,7 @@ pub fn metadata_target(sql: &str) -> Option<MetadataTarget> {
     let mut it = idents.iter().map(String::as_str);
     let verb = it.next()?;
 
-    // DESCRIBE t / DESC db.t / EXPLAIN t all name the table next.
+    // DESCRIBE t / DESC db.t name the table next.
     if verb.eq_ignore_ascii_case("describe") || verb.eq_ignore_ascii_case("desc") {
         return Some(last_of_qualified(&mut it));
     }
@@ -203,82 +197,136 @@ fn last_of_qualified<'a>(it: &mut impl Iterator<Item = &'a str>) -> MetadataTarg
     }
 }
 
-/// Every bare identifier in the statement, in order, skipping string and
-/// backtick literals so a keyword inside a value is never mistaken for one.
-///
-// TODO(villagesql): the quote/backtick/`''`-escape scanning here is hand-rolled
-// four times (idents_outside_strings, has_trailing_statement, qualified_refs,
-// table_refs). Extract one tokenizer yielding classified spans so a change to
-// the escape rules lands in a single place. Kept separate for now to avoid
-// reworking security-critical lexing in an unrelated change.
-fn idents_outside_strings(sql: &str) -> Vec<String> {
+/// One piece of a statement, split the way the server's lexer splits it.
+/// Strings and comments produce nothing. The text inside an executable comment
+/// (`/*! ... */`) is read as if the comment were not there, because the server
+/// runs it.
+#[derive(Debug, PartialEq)]
+enum Tok<'a> {
+    /// An identifier or keyword; `quoted` for a backtick-quoted one.
+    Word { text: &'a str, quoted: bool },
+    Number,
+    Dot,
+    Comma,
+    Semi,
+    Open,
+    Close,
+    Other,
+    /// Text the server may read in more than one way: a versioned executable
+    /// comment (`/*!80000 ... */`), which the server reads as code or skips
+    /// depending on its own version, or a quote after an odd run of
+    /// backslashes in a string, which ends the string only under
+    /// `NO_BACKSLASH_ESCAPES`.
+    Unclear,
+}
+
+/// Split `sql` into tokens. This is the one place that models MySQL's string,
+/// comment and identifier rules, so every check reads a statement the same way:
+/// `''` and a backslash both escape a quote inside a string, `--` starts a
+/// comment only when whitespace or the end follows it, and an identifier may
+/// start with a digit, `$`, or a non-ASCII character.
+fn tokens(sql: &str) -> Vec<Tok<'_>> {
     let bytes = sql.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
-    let mut in_single = false;
-    let mut in_double = false;
     while i < bytes.len() {
+        let rest = &bytes[i..];
         let c = bytes[i];
-        if in_single {
-            if c == b'\'' {
-                if bytes.get(i + 1) == Some(&b'\'') {
-                    i += 2;
-                    continue;
-                }
-                in_single = false;
-            }
+        if c.is_ascii_whitespace() {
             i += 1;
-            continue;
-        }
-        if in_double {
-            if c == b'"' {
-                in_double = false;
+        } else if rest.starts_with(b"/*!") {
+            i += 3;
+            if bytes.get(i).is_some_and(u8::is_ascii_digit) {
+                out.push(Tok::Unclear);
             }
-            i += 1;
-            continue;
-        }
-        // A comment between two keywords must not read as an identifier
-        // separating them, or `INTO/* x */OUTFILE` would slip past.
-        let after_gap = skip_gap(sql, i);
-        if after_gap != i {
-            i = after_gap;
-            continue;
-        }
-        match c {
-            b'\'' => {
-                in_single = true;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
                 i += 1;
             }
-            b'"' => {
-                in_double = true;
-                i += 1;
+        } else if rest.starts_with(b"*/") {
+            i += 2;
+        } else if rest.starts_with(b"/*") {
+            i = rest[2..]
+                .windows(2)
+                .position(|w| w == b"*/")
+                .map_or(bytes.len(), |end| i + 2 + end + 2);
+        } else if c == b'#' || is_dash_comment(rest) {
+            i = rest.iter().position(|&b| b == b'\n').map_or(bytes.len(), |end| i + end + 1);
+        } else if c == b'\'' || c == b'"' {
+            let (end, unclear) = skip_string(bytes, i);
+            if unclear {
+                out.push(Tok::Unclear);
             }
-            b'`' => {
-                let (_, ni) = read_ident(sql, i);
-                i = ni;
-            }
-            b'_' | b'a'..=b'z' | b'A'..=b'Z' => {
-                let (ident, ni) = read_ident(sql, i);
-                i = ni;
-                if ident.is_empty() {
-                    continue;
-                }
-                // Emit `db.t` as one token, so a caller can tell a qualifier
-                // from the next word in the statement.
-                let dot = skip_gap(sql, i);
-                if bytes.get(dot) == Some(&b'.') {
-                    let right_start = skip_gap(sql, dot + 1);
-                    let (right, ni2) = read_ident(sql, right_start);
-                    if !right.is_empty() {
-                        out.push(format!("{ident}.{right}"));
-                        i = ni2;
-                        continue;
-                    }
-                }
-                out.push(ident.to_owned());
-            }
-            _ => i += 1,
+            i = end;
+        } else if c == b'`' || is_ident_byte(c) {
+            let (text, next) = read_ident(sql, i);
+            i = next;
+            out.push(if c != b'`' && is_number(text) {
+                Tok::Number
+            } else {
+                Tok::Word { text, quoted: c == b'`' }
+            });
+        } else {
+            out.push(match c {
+                b'.' => Tok::Dot,
+                b',' => Tok::Comma,
+                b';' => Tok::Semi,
+                b'(' => Tok::Open,
+                b')' => Tok::Close,
+                _ => Tok::Other,
+            });
+            i += 1;
         }
+    }
+    out
+}
+
+/// `--` starts a comment only when whitespace, a control character, or the end
+/// of the statement follows it; `1--1` is arithmetic.
+fn is_dash_comment(rest: &[u8]) -> bool {
+    rest.starts_with(b"--") && rest.get(2).is_none_or(|&b| b.is_ascii_whitespace() || b.is_ascii_control())
+}
+
+/// The index just past the string that starts at `start`, honouring both the
+/// doubled-quote and the backslash escape, and whether the string has a quote
+/// after an odd run of backslashes. That quote is escaped by default but ends
+/// the string under `NO_BACKSLASH_ESCAPES`, so the string's end is unclear.
+fn skip_string(bytes: &[u8], start: usize) -> (usize, bool) {
+    let quote = bytes[start];
+    let mut unclear = false;
+    let mut i = start + 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            let run = bytes[i..].iter().take_while(|&&b| b == b'\\').count();
+            unclear |= run % 2 == 1 && bytes.get(i + run) == Some(&quote);
+            i += run + run % 2;
+        } else if bytes[i] == quote {
+            if bytes.get(i + 1) != Some(&quote) {
+                return (i + 1, unclear);
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    (bytes.len(), unclear)
+}
+
+/// Every identifier in the statement, in order, with `db.t` emitted as one
+/// entry so a caller can tell a qualifier from the next word.
+fn idents_outside_strings(sql: &str) -> Vec<String> {
+    let toks = tokens(sql);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        if let Tok::Word { text, .. } = toks[i] {
+            if let (Some(Tok::Dot), Some(Tok::Word { text: right, .. })) = (toks.get(i + 1), toks.get(i + 2)) {
+                out.push(format!("{text}.{right}"));
+                i += 3;
+                continue;
+            }
+            out.push(text.to_owned());
+        }
+        i += 1;
     }
     out
 }
@@ -287,8 +335,8 @@ fn idents_outside_strings(sql: &str) -> Vec<String> {
 fn strip_leading(sql: &str) -> &str {
     let mut s = sql.trim_start();
     loop {
-        if let Some(rest) = s.strip_prefix("--") {
-            s = rest.split_once('\n').map_or("", |x| x.1).trim_start();
+        if is_dash_comment(s.as_bytes()) {
+            s = s.split_once('\n').map_or("", |x| x.1).trim_start();
         } else if let Some(rest) = s.strip_prefix('#') {
             s = rest.split_once('\n').map_or("", |x| x.1).trim_start();
         } else if let Some(rest) = s.strip_prefix("/*") {
@@ -299,40 +347,18 @@ fn strip_leading(sql: &str) -> &str {
     }
 }
 
-/// True if a `;` is followed by further non-whitespace, non-comment content —
-/// i.e. a second statement. A trailing `;` alone is fine.
+/// True if a `;` is followed by anything but more `;`s, that is a second
+/// statement. A trailing `;` alone is fine.
 fn has_trailing_statement(sql: &str) -> bool {
-    let mut chars = sql.char_indices();
-    let bytes = sql.as_bytes();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_back = false;
-    while let Some((i, c)) = chars.next() {
-        match c {
-            '\'' if !in_double && !in_back => {
-                // Skip an escaped quote inside a single-quoted string.
-                if in_single && bytes.get(i + 1) == Some(&b'\'') {
-                    chars.next();
-                } else {
-                    in_single = !in_single;
-                }
-            }
-            '"' if !in_single && !in_back => in_double = !in_double,
-            '`' if !in_single && !in_double => in_back = !in_back,
-            ';' if !in_single && !in_double && !in_back => {
-                let rest = sql[i + 1..].trim_start();
-                let rest = strip_leading(rest);
-                return !rest.is_empty();
-            }
-            _ => {}
-        }
-    }
-    false
+    let toks = tokens(sql);
+    toks.iter()
+        .position(|t| *t == Tok::Semi)
+        .is_some_and(|p| toks[p + 1..].iter().any(|t| *t != Tok::Semi))
 }
 
 /// When a schema is configured, reject any `schema.` qualifier that names a
 /// different schema. An unqualified name needs no check: the loopback session's
-/// default database is the configured schema (see `Loopback::connect`), so the
+/// default database is the configured schema (see `Loopback::open`), so the
 /// name resolves inside it.
 ///
 /// Not every `x.y` is a schema reference. `p.name` qualifies a column with a
@@ -369,12 +395,14 @@ pub fn schema_violation(sql: &str, configured: &str) -> Option<String> {
             bound.push(alias);
         }
     }
-    for (schema, _table) in qualified_refs(sql) {
-        if bound.iter().any(|b| b.eq_ignore_ascii_case(&schema)) {
+    for q in qualified_refs(sql) {
+        // `alias.column` is not a schema, but `name.f()` always calls a
+        // function in schema `name`, whatever the statement binds.
+        if !q.call && bound.iter().any(|b| b.eq_ignore_ascii_case(&q.schema)) {
             continue;
         }
-        if !schema.eq_ignore_ascii_case(configured) {
-            return Some(schema);
+        if !q.schema.eq_ignore_ascii_case(configured) {
+            return Some(q.schema);
         }
     }
     None
@@ -392,120 +420,36 @@ pub fn ddl_schema_violation(sql: &str, configured: &str) -> Option<String> {
     }
     qualified_refs(sql)
         .into_iter()
-        .map(|(schema, _table)| schema)
+        .map(|q| q.schema)
         .find(|schema| !schema.eq_ignore_ascii_case(configured))
 }
 
-/// Find `<ident>.<ident>` references outside string literals, returning
-/// (schema, table) lowercased. Backtick-quoted identifiers are unwrapped so
-/// `` `mydb`.`t` `` is recognized. Single-quote handling matches
-/// `has_trailing_statement`, including the `''` escape.
-fn qualified_refs(sql: &str) -> Vec<(String, String)> {
+/// A `<ident>.<ident>` reference: the qualifier lowercased, and whether a `(`
+/// follows, which makes it a call to a function in that schema.
+struct Qualified {
+    schema: String,
+    call: bool,
+}
+
+/// Find `<ident>.<ident>` references.
+fn qualified_refs(sql: &str) -> Vec<Qualified> {
+    let toks = tokens(sql);
     let mut out = Vec::new();
-    let bytes = sql.as_bytes();
     let mut i = 0;
-    let mut in_single = false;
-    let mut in_double = false;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if in_single {
-            if c == b'\'' {
-                // A doubled '' is an escaped quote, not the end of the string.
-                if bytes.get(i + 1) == Some(&b'\'') {
-                    i += 2;
-                    continue;
-                }
-                in_single = false;
-            }
-            i += 1;
+    while i < toks.len() {
+        if let (Tok::Word { text: left, .. }, Some(Tok::Dot), Some(Tok::Word { .. })) =
+            (&toks[i], toks.get(i + 1), toks.get(i + 2))
+        {
+            out.push(Qualified {
+                schema: left.to_ascii_lowercase(),
+                call: toks.get(i + 3) == Some(&Tok::Open),
+            });
+            i += 3;
             continue;
         }
-        if in_double {
-            if c == b'"' {
-                in_double = false;
-            }
-            i += 1;
-            continue;
-        }
-        match c {
-            b'\'' => {
-                in_single = true;
-                i += 1;
-            }
-            b'"' => {
-                in_double = true;
-                i += 1;
-            }
-            b'`' | b'_' | b'a'..=b'z' | b'A'..=b'Z' => {
-                let (left, ni) = read_ident(sql, i);
-                i = ni;
-                // MySQL accepts whitespace and comments around the qualifying
-                // dot, so `db . t` is the same reference as `db.t`. Skipping
-                // them here is what stops that spacing being a way past the
-                // schema check.
-                let dot = skip_gap(sql, i);
-                if bytes.get(dot) == Some(&b'.') {
-                    let right_start = skip_gap(sql, dot + 1);
-                    let (right, ni2) = read_ident(sql, right_start);
-                    if !right.is_empty() {
-                        out.push((left.to_ascii_lowercase(), right.to_ascii_lowercase()));
-                        i = ni2;
-                    }
-                }
-            }
-            _ => i += 1,
-        }
+        i += 1;
     }
     out
-}
-
-/// Advance past whitespace and comments starting at `start`, returning the
-/// index of the next byte that is neither. Used wherever MySQL allows a gap
-/// that must not change how a reference reads.
-///
-/// An executable comment (`/*!mcpalt*/`, `/*!80000 mcpalt */`) is not a gap:
-/// the server runs the text inside it. Only its markers are skipped, so the
-/// scanners read the text as if it had no comment around it. A version that
-/// is newer than the server makes the server ignore the text; reading it anyway
-/// costs at most a needless rejection.
-///
-/// Works on bytes throughout. The scanners that call this walk unrecognized
-/// bytes one at a time, so `start` can land in the middle of a multibyte UTF-8
-/// sequence (a Unicode identifier, which MySQL allows); slicing the `str` there
-/// would panic, so every comparison here is against the byte slice.
-fn skip_gap(sql: &str, start: usize) -> usize {
-    let bytes = sql.as_bytes();
-    let mut i = start;
-    loop {
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if bytes[i..].starts_with(b"/*!") {
-            i += 3;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-        } else if bytes[i..].starts_with(b"*/") {
-            i += 2;
-        } else if bytes[i..].starts_with(b"/*") {
-            match find_bytes(&bytes[i + 2..], b"*/") {
-                Some(end) => i = i + 2 + end + 2,
-                None => return bytes.len(),
-            }
-        } else if bytes[i..].starts_with(b"--") || bytes.get(i) == Some(&b'#') {
-            match bytes[i..].iter().position(|&b| b == b'\n') {
-                Some(end) => i += end + 1,
-                None => return bytes.len(),
-            }
-        } else {
-            return i;
-        }
-    }
-}
-
-/// Index of the first occurrence of `needle` in `haystack`, by bytes.
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// A table named in table position, with its `schema.` qualifier and the alias
@@ -559,7 +503,7 @@ pub fn tables_for_allowlist(sql: &str, explain: &Json) -> Vec<String> {
 /// Deliberately eager on the table side: over-reporting a name costs a
 /// rejection, under-reporting one costs the allowlist.
 pub fn table_refs(sql: &str) -> Vec<TableRef> {
-    const TABLE_KEYWORDS: &[&str] = &["from", "join", "into", "update", "table"];
+    const TABLE_KEYWORDS: &[&str] = &["from", "join", "straight_join", "into", "update", "table"];
     // Words that can follow a table reference without being an alias. Missing
     // one costs a needless rejection; a schema named after one of these would
     // be the only way to lose a check, which is not a case worth widening for.
@@ -569,111 +513,84 @@ pub fn table_refs(sql: &str) -> Vec<TableRef> {
         "values", "select", "and", "or", "not", "partition", "force", "use", "ignore", "with",
         "window", "procedure", "lock", "offset", "as",
     ];
-
-    let bytes = sql.as_bytes();
+    let toks = tokens(sql);
     let mut out: Vec<TableRef> = Vec::new();
-    let mut i = 0;
-    let mut in_single = false;
-    let mut in_double = false;
     let mut expect_table = false;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if in_single {
-            if c == b'\'' {
-                if bytes.get(i + 1) == Some(&b'\'') {
+    let mut i = 0;
+    while i < toks.len() {
+        let Some((text, quoted)) = word(toks.get(i)) else {
+            // `FROM (t1)` still names a table, so `(` keeps the expectation;
+            // anything else ends it.
+            if toks[i] != Tok::Open {
+                expect_table = false;
+            }
+            i += 1;
+            continue;
+        };
+        i += 1;
+        if !quoted && TABLE_KEYWORDS.iter().any(|k| text.eq_ignore_ascii_case(k)) {
+            expect_table = true;
+            continue;
+        }
+        if !expect_table {
+            continue;
+        }
+        expect_table = false;
+        // `FROM (SELECT ...)` is a derived table, not a name; the inner FROM
+        // sets the expectation again for the real one.
+        if !quoted && ["select", "with", "values"].iter().any(|k| text.eq_ignore_ascii_case(k)) {
+            continue;
+        }
+        // `schema.table` keeps the right half, matching EXPLAIN, and
+        // remembers the left so scoping can test it.
+        let mut schema = None;
+        let mut table = text.to_ascii_lowercase();
+        if toks.get(i) == Some(&Tok::Dot) {
+            if let Some((right, _)) = word(toks.get(i + 1)) {
+                schema = Some(table);
+                table = right.to_ascii_lowercase();
+                i += 2;
+            }
+        }
+        // An alias may follow, with or without AS. A word that cannot be an
+        // alias is left unconsumed, because some of them (JOIN) introduce the
+        // next table.
+        let mut alias = None;
+        match word(toks.get(i)) {
+            Some((next, false)) if next.eq_ignore_ascii_case("as") => {
+                if let Some((named, _)) = word(toks.get(i + 1)) {
+                    alias = Some(named.to_ascii_lowercase());
                     i += 2;
-                    continue;
                 }
-                in_single = false;
             }
+            Some((next, next_quoted))
+                if next_quoted || !NOT_AN_ALIAS.iter().any(|k| next.eq_ignore_ascii_case(k)) =>
+            {
+                alias = Some(next.to_ascii_lowercase());
+                i += 1;
+            }
+            _ => {}
+        }
+        out.push(TableRef { schema, table, alias });
+        // A comma after a table, or after the `)` closing `(t1 a)`, starts the
+        // next table of a comma join.
+        while toks.get(i) == Some(&Tok::Close) {
             i += 1;
-            continue;
         }
-        if in_double {
-            if c == b'"' {
-                in_double = false;
-            }
+        if toks.get(i) == Some(&Tok::Comma) {
+            expect_table = true;
             i += 1;
-            continue;
-        }
-        // A comment between the keyword and the name must not lose the name.
-        let after_gap = skip_gap(sql, i);
-        if after_gap != i {
-            i = after_gap;
-            continue;
-        }
-        match c {
-            b'\'' => {
-                in_single = true;
-                i += 1;
-            }
-            b'"' => {
-                in_double = true;
-                i += 1;
-            }
-            b'`' | b'_' | b'a'..=b'z' | b'A'..=b'Z' => {
-                let quoted = c == b'`';
-                let (ident, ni) = read_ident(sql, i);
-                i = ni;
-                if !quoted && TABLE_KEYWORDS.iter().any(|k| ident.eq_ignore_ascii_case(k)) {
-                    expect_table = true;
-                    continue;
-                }
-                if !expect_table {
-                    continue;
-                }
-                expect_table = false;
-                if ident.is_empty() {
-                    continue;
-                }
-                // `schema.table` keeps the right half, matching EXPLAIN, and
-                // remembers the left so scoping can test it.
-                let mut schema = None;
-                let mut table = ident.to_ascii_lowercase();
-                let dot = skip_gap(sql, i);
-                if bytes.get(dot) == Some(&b'.') {
-                    let right_start = skip_gap(sql, dot + 1);
-                    let (right, ni2) = read_ident(sql, right_start);
-                    if !right.is_empty() {
-                        schema = Some(table);
-                        table = right.to_ascii_lowercase();
-                        i = ni2;
-                    }
-                }
-                // An alias may follow, with or without AS. A word that cannot
-                // be an alias is left unconsumed, because some of them (JOIN)
-                // introduce the next table.
-                let mut alias = None;
-                let peek = skip_gap(sql, i);
-                let (next, after_next) = read_ident(sql, peek);
-                if next.eq_ignore_ascii_case("as") {
-                    let alias_start = skip_gap(sql, after_next);
-                    let (named, after_alias) = read_ident(sql, alias_start);
-                    if !named.is_empty() {
-                        alias = Some(named.to_ascii_lowercase());
-                        i = after_alias;
-                    }
-                } else if !next.is_empty()
-                    && !NOT_AN_ALIAS.iter().any(|k| next.eq_ignore_ascii_case(k))
-                {
-                    alias = Some(next.to_ascii_lowercase());
-                    i = after_next;
-                }
-                out.push(TableRef {
-                    schema,
-                    table,
-                    alias,
-                });
-            }
-            _ => {
-                // `FROM (SELECT ...)` is a derived table, not a name; the inner
-                // FROM sets the flag again for the real one.
-                expect_table = false;
-                i += 1;
-            }
         }
     }
     out
+}
+
+/// The text of a word token, and whether it was backtick-quoted.
+fn word<'a>(t: Option<&Tok<'a>>) -> Option<(&'a str, bool)> {
+    match t {
+        Some(Tok::Word { text, quoted }) => Some((text, *quoted)),
+        _ => None,
+    }
 }
 
 /// Read one identifier (bare or backtick-quoted) starting at byte `start`,
@@ -682,18 +599,33 @@ fn read_ident(sql: &str, start: usize) -> (&str, usize) {
     let bytes = sql.as_bytes();
     if bytes.get(start) == Some(&b'`') {
         let mut i = start + 1;
-        while i < bytes.len() && bytes[i] != b'`' {
-            i += 1;
+        // A doubled backtick is a backtick inside the name.
+        while i < bytes.len() && (bytes[i] != b'`' || bytes.get(i + 1) == Some(&b'`')) {
+            i += if bytes[i] == b'`' { 2 } else { 1 };
         }
         let text = &sql[start + 1..i];
         // Skip the closing backtick when present.
         return (text, if i < bytes.len() { i + 1 } else { i });
     }
     let mut i = start;
-    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$') {
+    while i < bytes.len() && is_ident_byte(bytes[i]) {
         i += 1;
     }
     (&sql[start..i], i)
+}
+
+/// Whether `c` can be part of an unquoted MySQL identifier: ASCII letters,
+/// digits, `_`, `$`, and any byte of a non-ASCII character. An identifier may
+/// start with any of them, so `2mydb.t` and `$mydb.t` name schemas `2mydb` and
+/// `$mydb`, not `mydb`.
+fn is_ident_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80
+}
+
+/// An unquoted word made only of digits is a number, never an identifier, so
+/// the `1` in `1.5` does not qualify the `5`.
+fn is_number(word: &str) -> bool {
+    !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Given the JSON returned by `EXPLAIN FORMAT=JSON`, collect every
@@ -730,6 +662,15 @@ fn walk_tables(node: &Json, out: &mut Vec<String>) {
     }
 }
 
+/// Refuse `table` when the allowlist does not permit it.
+pub fn check_table(table: &str, allowlist: &[String]) -> Result<(), String> {
+    if table_allowed(table, allowlist) {
+        Ok(())
+    } else {
+        Err(format!("table '{table}' is not in vsql_mcp.allowed_tables"))
+    }
+}
+
 /// True if `table` (a bare name from EXPLAIN) is permitted by an allowlist that
 /// may hold bare or `schema.table` entries. Matching is on the table name.
 pub fn table_allowed(table: &str, allowlist: &[String]) -> bool {
@@ -740,4 +681,153 @@ pub fn table_allowed(table: &str, allowlist: &[String]) -> bool {
         let bare = entry.rsplit('.').next().unwrap_or(entry);
         bare.eq_ignore_ascii_case(table)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_reads_the_leading_verb() {
+        assert_eq!(classify("SELECT 1"), StmtKind::Read);
+        assert_eq!(classify("  -- note\n/* c */ select 1"), StmtKind::Read);
+        assert_eq!(classify("INSERT INTO t VALUES (1)"), StmtKind::Write);
+        assert_eq!(classify("DROP TABLE t"), StmtKind::Disallowed);
+        assert_eq!(classify("(SELECT 1)"), StmtKind::Disallowed);
+    }
+
+    #[test]
+    fn classify_reads_inside_an_executable_comment() {
+        assert_eq!(classify("/*! DELETE FROM t */ SELECT 1"), StmtKind::Write);
+        // A `#` comment inside the executable comment hides its first `*/`.
+        assert_eq!(
+            classify("/*!40000 # */ INSERT INTO t VALUES (1)\n DROP TABLE t */"),
+            StmtKind::Disallowed
+        );
+    }
+
+    #[test]
+    fn a_second_statement_is_disallowed() {
+        assert_eq!(classify("SELECT 1; DROP TABLE t"), StmtKind::Disallowed);
+        assert_eq!(classify("SELECT 1;"), StmtKind::Read);
+        assert_eq!(classify("SELECT 1; -- done"), StmtKind::Read);
+        assert_eq!(classify("SELECT 'a;b'"), StmtKind::Read);
+        assert_eq!(classify("SELECT 1 -- ;x"), StmtKind::Read);
+        // A quote inside a comment does not open a string.
+        assert_eq!(classify("SELECT 1 -- '\n; DELETE FROM t; -- '"), StmtKind::Disallowed);
+        // A backslash before a quote makes the string's end unclear.
+        assert_eq!(classify("SELECT 'a\\' ; SELECT 2' AS s"), StmtKind::Disallowed);
+        assert_eq!(classify("SELECT 'a\\'' ; DELETE FROM t"), StmtKind::Disallowed);
+    }
+
+    #[test]
+    fn statements_the_server_may_read_two_ways_are_disallowed() {
+        // The server skips a versioned comment newer than itself.
+        assert_eq!(classify("SELECT * FROM /*!999999 'x */ other.t /*!999999 ' */"), StmtKind::Disallowed);
+        assert_eq!(classify("/*!80000 SELECT */ 1"), StmtKind::Disallowed);
+        // `\'` ends the string under NO_BACKSLASH_ESCAPES.
+        assert_eq!(classify("SELECT 'a\\' AS x, other.f() AS y, 'b' AS z"), StmtKind::Disallowed);
+        // An even run of backslashes is the same either way.
+        assert_eq!(classify("SELECT 'a\\\\' AS x"), StmtKind::Read);
+        assert_eq!(classify("SELECT 'a\\_b' AS x"), StmtKind::Read);
+        // An unversioned executable comment is always code, so it is read.
+        assert_eq!(classify("SELECT /*! 1 */"), StmtKind::Read);
+    }
+
+    #[test]
+    fn schema_violation_finds_every_other_schema() {
+        let other = |sql: &str| schema_violation(sql, "app");
+        assert_eq!(other("SELECT * FROM app.t"), None);
+        assert_eq!(other("SELECT p.total FROM orders p"), None);
+        assert_eq!(other("SELECT t1.id FROM t1"), None);
+        assert_eq!(other("SELECT 'other.t'"), None);
+        assert_eq!(other("SELECT 1.5"), None);
+        for sql in [
+            "SELECT * FROM other.t",
+            "SELECT * FROM `other`.t",
+            "SELECT * FROM other . t",
+            "SELECT * FROM other/* gap */.t",
+            "SELECT * FROM 2app.t",
+            "SELECT * FROM $app.t",
+            "SELECT * FROM \u{e9}app.t",
+            "SELECT other.f()",
+            // A comma join or STRAIGHT_JOIN with an alias named after the schema.
+            "SELECT * FROM t1 other, other.t",
+            "SELECT * FROM t1 other STRAIGHT_JOIN other.t",
+            "SELECT * FROM (t1 other), other.t",
+            // A quote in a comment, a backslash escape, and `--` without a space.
+            "SELECT /* ' */ other.f() /* ' */",
+            "SELECT '\\'' , other.f() -- '",
+            "SELECT 1--1, other.f()",
+            "SELECT /*!other.f()*/",
+            // An alias named after the schema does not hide a function call.
+            "SELECT other.f() FROM app.t1 other",
+        ] {
+            assert!(other(sql).is_some(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn ddl_schema_violation_checks_every_qualifier() {
+        let other = |sql: &str| ddl_schema_violation(sql, "app");
+        assert_eq!(other("CREATE TABLE app.t (i INT)"), None);
+        assert_eq!(other("DROP TABLE app.secret, secret.t").as_deref(), Some("secret"));
+        assert_eq!(other("RENAME TABLE app.t TO other.t").as_deref(), Some("other"));
+        assert_eq!(other("DROP TABLE 2app.t").as_deref(), Some("2app"));
+    }
+
+    #[test]
+    fn file_writes_are_found() {
+        assert_eq!(file_write_target("SELECT 1 INTO OUTFILE '/tmp/x'"), Some("INTO OUTFILE"));
+        assert_eq!(file_write_target("SELECT 1 INTO/* x */DUMPFILE '/tmp/x'"), Some("INTO DUMPFILE"));
+        assert_eq!(file_write_target("SELECT 1--1 INTO OUTFILE '/tmp/x'"), Some("INTO OUTFILE"));
+        assert_eq!(file_write_target("SELECT 'into outfile'"), None);
+    }
+
+    #[test]
+    fn metadata_target_reads_the_table() {
+        let table = |sql: &str| match metadata_target(sql) {
+            Some(MetadataTarget::Table(t)) => Some(t),
+            _ => None,
+        };
+        assert_eq!(table("DESCRIBE app.orders").as_deref(), Some("orders"));
+        assert_eq!(table("SHOW COLUMNS FROM orders").as_deref(), Some("orders"));
+        assert_eq!(table("SHOW CREATE TABLE `secret`").as_deref(), Some("secret"));
+        assert_eq!(table("DESCRIBE `secret` orders").as_deref(), Some("secret"));
+        assert!(matches!(metadata_target("SHOW TABLES"), Some(MetadataTarget::NotTableScoped)));
+        assert!(metadata_target("SELECT 1").is_none());
+    }
+
+    #[test]
+    fn show_outside_schema_forms() {
+        assert!(show_outside_schema("SHOW TABLES FROM other"));
+        assert!(show_outside_schema("SHOW DATABASES"));
+        assert!(show_outside_schema("SHOW /*!40000 DATABASES */"));
+        assert!(!show_outside_schema("SHOW TABLES"));
+        assert!(!show_outside_schema("SELECT 1 FROM t"));
+    }
+
+    #[test]
+    fn ddl_forms() {
+        assert!(is_allowed_ddl("CREATE TABLE t (i INT)"));
+        assert!(is_allowed_ddl("create unique index ix on t (i)"));
+        assert!(!is_allowed_ddl("DROP DATABASE d"));
+        assert!(!is_allowed_ddl("CREATE TABLE t (i INT); DROP TABLE u"));
+        assert!(!is_allowed_ddl("CREATE TABLE t (i INT) TABLESPACE = innodb_system"));
+        assert!(!is_allowed_ddl("/*!CREATE TABLE t (i INT)*/"));
+    }
+
+    #[test]
+    fn allowlist_maps_aliases_to_tables() {
+        let plan = serde_json::json!({"query_block": {"table": {"table_name": "customers"}}});
+        assert_eq!(tables_for_allowlist("SELECT * FROM secret AS customers", &plan), ["secret"]);
+        let plan = serde_json::json!({"query_block": {"nested_loop": [
+            {"table": {"table_name": "a"}}, {"table": {"table_name": "customers"}}]}});
+        assert_eq!(
+            tables_for_allowlist("SELECT * FROM orders a, secret customers", &plan),
+            ["orders", "secret"]
+        );
+        assert!(table_allowed("orders", &["app.orders".to_owned()]));
+        assert!(!table_allowed("secret", &["orders".to_owned()]));
+    }
 }

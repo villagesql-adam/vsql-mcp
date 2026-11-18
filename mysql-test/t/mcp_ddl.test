@@ -99,6 +99,10 @@ elif MODE == "schema":
     for label, sql in [
         ("schema_alter_other", "ALTER TABLE mcpalt.t1 ADD COLUMN z INT"),
         ("schema_rename_out", "RENAME TABLE mcpsec.d2 TO mcpalt.d2"),
+        # An unquoted name can start with a digit or `$` (written \x24 so
+        # mysqltest does not read a variable).
+        ("schema_digit_prefix", "DROP TABLE 2mcpsec.t1"),
+        ("schema_dollar_prefix", "DROP TABLE \x24mcpsec.t1"),
         ("schema_foreign_key",
          "CREATE TABLE mcpsec.fk1 (id INT, FOREIGN KEY (id) REFERENCES mcpalt.t1 (id))"),
         # A table in the exposed schema named like the other schema used to

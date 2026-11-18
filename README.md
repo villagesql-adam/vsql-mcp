@@ -20,8 +20,8 @@ a connected agent.
 ERROR 3219 (HY000): Failed to load VEF extension 'vsql_mcp': no matching ABI version for capability 'vsql::sys_var' (extension requires ver-2 + descriptor ver-1)
 ```
 
-`vsql_mcp` uses the VEF preview capabilities `thread_worker`, `sys_var`,
-`status_var`, and `sql_query`, so the server must allow preview extensions:
+`vsql_mcp` uses the VEF preview capabilities `thread_worker`, `sys_var`, and
+`status_var`, so the server must allow preview extensions:
 
 ```bash
 mysqld --vsql_allow_preview_extensions=ON ...
@@ -72,7 +72,7 @@ INSTALL EXTENSION vsql_mcp;
 
 The extension registers its configuration and status variables immediately;
 nothing listens until you turn `vsql_mcp.vsql_mcp_enabled` ON.
-`vsql_mcp.db_url` is only needed for the `query` and `write` tools — see
+Every tool that reads the database needs `vsql_mcp.db_url` — see
 [How queries run](#how-queries-run).
 
 `UNINSTALL EXTENSION vsql_mcp` takes those variables away again, and with them
@@ -166,27 +166,14 @@ front of the endpoint.
 
 ## How queries run
 
-Three of the seven built-in tools — `list_schemas`, `list_tables`, and `describe_table` —
-plus the `vsql://<schema>` resource listing run in-process, via the
-`sql_query` capability. Their column layout is fixed in the extension's own
-code, so no round trip is needed to name or type a result.
-
-Everything else — the `query` tool's arbitrary SQL, the `write` and `ddl` tools,
-the tools other extensions declare, EXPLAIN, and `SHOW CREATE TABLE` (behind the
-`vsql://<schema>/<table>` resource) — runs
-through a **loopback client connection** to the server, configured by
-`vsql_mcp.db_url`. `sql_query` cannot host these: as of this SDK version it
-reports no column names or types at all, so it cannot label an arbitrary
-query's result columns or `SHOW CREATE TABLE`'s `Create Table` column; and a
-session is only reachable from the worker thread that opened it, so it cannot
-host the `KILL`-based write timeout described in
-[Known Limitations](#known-limitations) either.
-
-Point `db_url` at a dedicated MySQL account and those tool calls run as that
-account under its real `GRANT`s — the allowlist and read-only enforcement
-below are defense in depth on top of the grants, not a replacement for them.
-`db_url` is still required if you use `query` or `write`; it is not required
-for schema/table browsing alone.
+Every tool and resource runs its SQL over a **loopback client connection** to
+the server, configured by `vsql_mcp.db_url`, so every call runs as that account
+under its real `GRANT`s. Each statement goes to the server as a prepared
+statement, which the server runs as exactly one statement: text after a `;` is
+a syntax error, never a second statement. Values that a tool looks up, such as
+a schema or table name, are bound parameters. The `vsql://<schema>/<table>`
+resource puts the names into `SHOW CREATE TABLE` quoted with backticks. The
+listing tools show only the schemas and tables that the account has grants on.
 
 ## Configuration
 
@@ -196,9 +183,7 @@ All variables are `SET GLOBAL vsql_mcp.<name>`.
 |---|---|---|
 | `vsql_mcp_enabled` | OFF | Start/stop the server |
 | `port` | 3100 | HTTP listen port (0 = OS-assigned) |
-| `ssl_port` | 3143 | HTTPS listen port (0 = OS-assigned) |
-| `ssl_cert` / `ssl_key` | `""` | PEM paths; both required to serve HTTPS |
-| `schema` | `""` | Schema to expose (empty = all non-system schemas) |
+| `schema` | `""` | Schema to expose (empty = every schema the `db_url` account can see) |
 | `require_auth` | OFF | Require a bearer token on every request |
 | `bearer_token` | `""` | Static token checked when `require_auth` is ON |
 | `allow_write` | OFF | Enable the `write` tool |
@@ -209,11 +194,8 @@ All variables are `SET GLOBAL vsql_mcp.<name>`.
 | `session_ttl` | 1800 | Idle MCP session lifetime (seconds) |
 | `db_url` | `""` | Loopback DSN tool queries run through |
 
-HTTPS is served when both `ssl_cert` and `ssl_key` are set, and not otherwise —
-leaving either empty is how you turn TLS off, whatever `ssl_port` says.
-
-Port and TLS changes take effect when the server is next enabled — toggle
-`vsql_mcp_enabled` OFF then ON after changing them.
+A port change takes effect when the server is next enabled — toggle
+`vsql_mcp_enabled` OFF then ON after changing it.
 
 ## Tools
 
@@ -223,7 +205,7 @@ tools that installed extensions declare (see
 
 | Tool | Purpose |
 |---|---|
-| `list_schemas` | Schemas visible to the extension |
+| `list_schemas` | Schemas the `db_url` account can see |
 | `list_tables` | Tables and views in a schema, with row estimates |
 | `describe_table` | Columns, types, and keys for a table |
 | `query` | Run a single read-only `SELECT` and return JSON rows |
@@ -285,22 +267,30 @@ after a `;` is a syntax error and never a second statement.
 ### Guardrails
 
 Applied to every `query`, `explain`, and `write` call (and to `ddl` as described
-in [Schema changes](#schema-changes)):
+in [Schema changes](#schema-changes)). The guardrails read the statement text to
+give an agent a clear refusal. A statement can get past them, so they do not
+replace the `db_url` account's grants (see
+[Security Considerations](#security-considerations)):
 
 - **Read-only enforcement.** `query` accepts a single `SELECT`/`SHOW`/`WITH`/
   `EXPLAIN`/`DESCRIBE`; the loopback session is also set `READ ONLY`. `write`
   accepts a single `INSERT`/`UPDATE`/`DELETE`/`REPLACE` and only when
-  `allow_write` is ON. A trailing second statement is rejected.
+  `allow_write` is ON. A trailing second statement is rejected, and so is a
+  statement that the server could read in two ways: one with a versioned
+  comment such as `/*!80000 ... */`, or a string with a quote after a backslash
+  (write `''` for a quote instead).
 - **No row ceiling on writes.** `max_rows` caps what a `query` returns; nothing
   caps what a `write` changes. An unqualified `DELETE` empties the table. Give
   `db_url` an account whose grants match the blast radius you are willing to
   accept.
-- **Schema scoping.** With `schema` set, a reference to any other schema is
-  rejected. The exposed schema is the loopback connection's default database,
+- **Schema scoping.** With `schema` set, a reference to another schema is
+  rejected. A statement can still reach another schema without naming it, for
+  example through a view or a stored function, so grant the `db_url` account
+  nothing outside the exposed schema. The exposed schema is the loopback connection's default database,
   so a bare table name such as `orders` resolves inside it, and any database
-  named in `db_url` is ignored. If the schema does not exist, the `query`,
-  `explain`, and `write` tools fail with
-  `vsql_mcp.schema 'mydb' does not exist`. Aliases and table-qualified columns
+  named in `db_url` is ignored. If the schema does not exist, every tool that
+  runs SQL fails with
+  `vsql_mcp.schema 'mydb' does not exist, or the db_url account has no grant on it`. Aliases and table-qualified columns
   work normally — `p.total` is a column, not a schema.
 
   A `SHOW` statement with `FROM` or `IN`, `SHOW CREATE DATABASE`, and a `SHOW`
@@ -366,7 +356,7 @@ origin gets HTTP 403), as the MCP Streamable HTTP spec requires.
 | `vsql_mcp.tool_errors_total` | Tool calls that returned an error |
 | `vsql_mcp.sessions_active` | Live MCP sessions |
 | `vsql_mcp.rows_returned_total` | Rows returned by the `query` tool |
-| `vsql_mcp.http_port` / `vsql_mcp.https_port` | Actually-bound ports (0 = not listening) |
+| `vsql_mcp.http_port` | Actually-bound port (0 = not listening) |
 
 `SELECT vsql_mcp.info();` returns the same liveness summary as JSON. The
 worker tries to bind the listener on its next wakeup, which comes every 25 ms,
@@ -375,32 +365,43 @@ with `"enabled": false`.
 
 ## Known Limitations
 
-- **Most SQL still runs through a loopback connection.** `sql_query` (as of
-  this SDK version) reports no column names or types, so it can only host the
-  three tools whose result shape is already fixed in this extension's own code
-  (see [How queries run](#how-queries-run)). `query`, `write`, `explain`, and
-  the table-DDL resource still reach the database over a client connection
-  configured by `vsql_mcp.db_url`. Set `db_url` to a dedicated account.
 - **No SSE / server-initiated messages.** `GET /mcp` returns HTTP 405, which the
   spec allows for servers without a stream; there are no progress notifications.
 - **Requests are handled one at a time.** The worker drains and serves requests
-  serially; `query_timeout` bounds how long any one call can hold the line. A
+  serially; `query_timeout` bounds how long any one call can hold the line.
+  Each open HTTP connection holds a thread in the database server, before any
+  authentication, so a local process that opens many idle connections adds many
+  server threads.
+- **A read can hold locks.** A read-only session still allows
+  `SELECT ... FOR SHARE` and `GET_LOCK()`, so a `query` call can make writers
+  wait for up to `query_timeout` seconds.
+- **The server timeout covers `SELECT` only.** `MAX_EXECUTION_TIME` does not
+  apply to `SHOW` or `DESCRIBE`. For those, the client stops waiting after
+  `query_timeout` plus five seconds, and the server may run the statement a
+  little longer. A
   stalled request body is read on a helper thread with a bounded wait, so a slow
   client cannot wedge the worker or block disable/shutdown.
 - **The allowlist does not see through a stored function.** `allowed_tables` and
   `schema` are enforced on the tables a statement plans with `EXPLAIN`, which
   does not descend into a function body. A `SELECT some_function()` names no
   table, so it passes both checks even if the function reads an excluded table.
-  Likewise a read tool can call any function the `db_url` account may call —
-  including one that opens a network connection (`http_get()` and the like) — so
-  a read grants the full reach of installed functions, not only table reads.
   When you need hard confinement, put it in the `db_url` account's `GRANT`s, not
   only in `allowed_tables`. The same holds for the
   [tools other extensions declare](#tools-from-other-extensions): `allowed_tables`
   and `schema` do not apply to them.
-- **Secrets are visible to privileged users.** `bearer_token` and `db_url` (which
-  embeds a password) are global variables readable via `SHOW VARIABLES` by users
-  with the privilege.
+- **An agent can call every installed extension's functions.** VillageSQL does
+  not check a privilege when a statement calls an extension function, so a
+  `db_url` account with only `SELECT` on one schema can still call them, and no
+  grant stops it. A function that opens a network connection, such as
+  `http_get()` or a DuckDB query that reads a URL, lets an agent reach the network
+  from the database server. Install only the extensions that you would let an
+  agent call.
+- **Any account can read the secrets.** `bearer_token` and `db_url` (which
+  embeds a password) are global variables, and any MySQL account can read them
+  with `SHOW VARIABLES`, even one with only `USAGE`. The agent can too, through
+  the `query` tool. An extension cannot mark a
+  variable as sensitive yet. Anyone who reads the password can connect as the
+  `db_url` account, so give that account only what an agent may have.
 - **A `write` that overruns is killed, not waited out.** `MAX_EXECUTION_TIME`
   applies to `SELECT` only, so `query_timeout` is enforced on a write by issuing
   `KILL QUERY` against its own connection. The statement is aborted and rolled
@@ -413,14 +414,30 @@ with `"enabled": false`.
 `vsql_mcp` opens a network listener and executes agent-supplied SQL, so treat it
 as a security boundary:
 
-- Bind is `127.0.0.1` only; front it with a reverse proxy if you need remote
-  access, and terminate TLS there or via `ssl_cert`/`ssl_key`.
-- Give `db_url` a least-privilege account. Read-only is enough unless you enable
-  the `write` or `ddl` tool, and the account's `GRANT`s are the real access control.
+- The listener binds `127.0.0.1` only and serves plain HTTP. For remote access
+  or TLS, put a reverse proxy in front of it, and let the proxy limit how many
+  connections a client can hold open.
+- The `db_url` account's `GRANT`s are the limit on what an agent can read and
+  change. `schema`, `allowed_tables`, and the statement checks give an agent a
+  clear refusal, but a statement can get past them. Grant the account only what
+  an agent may reach:
+
+  | When you use | Grant on the exposed schema, or on each allowed table |
+  |---|---|
+  | The read tools | `SELECT` (and `SHOW VIEW` for views) |
+  | `write` | `INSERT`, `UPDATE`, `DELETE` |
+  | `ddl` | `CREATE`, `ALTER`, `DROP`, `INDEX` |
+
+  Do not grant `FILE`, any global privilege, or any privilege on another
+  schema. Every tool that runs SQL checks the account first, and refuses to run
+  when it holds a privilege on every database (`*.*`), such as root, or a
+  grant on a database pattern that contains `%`. `SELECT`
+  and `SHOW VIEW` on every database are allowed only while neither `schema` nor
+  `allowed_tables` is set. The check reads the account's own grants, not the
+  privileges of a role it uses.
 - Keep `require_auth` ON for anything beyond a local experiment, and prefer a
   proxy that maps identities over the single static token.
-- `allowed_tables` and `schema` narrow what an agent can reach even within the
-  account's grants.
+- `allowed_tables` and `schema` also decide which tables the tools list.
 
 ## Adding a tool
 
@@ -456,7 +473,7 @@ Then write the handler, which receives the call arguments, the live
 configuration, and the executor:
 
 ```rust
-fn list_indexes(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Json, String>
+fn list_indexes(args: &Json, cfg: &RequestConfig, exec: &Loopback) -> Result<Json, String>
 ```
 
 `describe_table` is the closest handler to copy, and the helpers it uses are
@@ -465,12 +482,9 @@ available to any handler:
 - `guardrails::table_allowed` applies the operator's `allowed_tables` list.
 - `effective_schema` returns the configured schema when `vsql_mcp.schema` is
   set, and the caller's `schema` argument when it is not.
-- `exec.read_params` runs a statement with positional parameters. Give it the
-  result columns in the order the select list names them, because the
-  in-process path cannot read the server's own column names back. It uses that
-  in-process path through `sql_query` where the capability is available, and
-  the `db_url` connection where it is not.
-- `exec.read()` runs arbitrary SQL, always over the `db_url` connection.
+- `exec.read_params` runs a statement with positional parameters. Pass every
+  caller value as a parameter, never in the SQL text.
+- `exec.read()` runs a statement with the `max_rows` cap.
 
 Build the new bundle and copy it into `veb_dir`:
 

@@ -35,7 +35,7 @@ sets this via `mysql-test/t/mcp_basic-master.opt`).
 | `src/ext_tools.rs` | Tools that other extensions declare with an `mcp_tools()` function |
 | `src/resources.rs` | The `vsql://` resources |
 | `src/guardrails.rs` | Statement classification, schema scoping, table-allowlist checks |
-| `src/executor.rs` | `QueryExecutor` trait + the loopback client implementation |
+| `src/executor.rs` | `Loopback`: runs every statement over the `db_url` connection |
 | `mysql-test/` | MTR suite (`t/`, `r/`) |
 
 ## Non-obvious rules
@@ -47,19 +47,17 @@ sets this via `mysql-test/t/mcp_basic-master.opt`).
   defers all config reads to the Periodic wakeup (see `PENDING_START` in
   `lib.rs`). This is the single most important invariant in the codebase.
 - The worker function is a fixed `fn` pointer with no captured state, so all
-  server state legitimately lives in statics (`SERVERS`, `SESSIONS`, the status
+  server state legitimately lives in statics (`SERVER`, `SESSIONS`, the status
   atomics).
-- `poll()` collects requests under the `SERVERS` lock, then drops the lock before
+- `poll()` collects requests under the `SERVER` lock, then drops the lock before
   handling them — a tool call can run for up to `query_timeout` seconds and must
   not block `stop()`.
-- SQL execution goes through the `QueryExecutor` trait. The loopback client is
-  the only implementation today; it is the seam that a native `sql_query` path
-  will replace. Keep new SQL behind the trait.
+- Every tool statement runs through `executor::Loopback` as a prepared statement, so the
+  `db_url` account's grants apply and one call runs one statement. Never use the
+  text protocol (`query_drop`, `query_iter`) for agent SQL: the driver always
+  enables multi-statements. Pass caller values as bound parameters.
 - Status-var names are declared without a component prefix; the server prefixes
   them, so `tool_calls_total` surfaces as `vsql_mcp.tool_calls_total`.
-- The `query` tool uses the binary protocol (typed values); `EXPLAIN` and
-  `SHOW CREATE` go through `read_text` because the prepared protocol may reject
-  them.
 
 ## Conventions
 

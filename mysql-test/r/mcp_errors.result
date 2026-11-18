@@ -1,6 +1,7 @@
 INSTALL EXTENSION vsql_mcp;
 CREATE USER mcpuser@'127.0.0.1';
-GRANT SELECT, SHOW VIEW ON *.* TO mcpuser@'127.0.0.1';
+GRANT SELECT, SHOW VIEW ON mcpsec.* TO mcpuser@'127.0.0.1';
+GRANT SELECT, SHOW VIEW ON mcpalt.* TO mcpuser@'127.0.0.1';
 CREATE SCHEMA mcpsec;
 GRANT INSERT, UPDATE, DELETE ON mcpsec.* TO mcpuser@'127.0.0.1';
 CREATE TABLE mcpsec.t1 (id INT PRIMARY KEY, name VARCHAR(50));
@@ -74,6 +75,7 @@ UPDATE mcpsec.t1 SET name = CONCAT('row', id);
 # --- empty states ---
 CREATE TABLE mcpsec.empty_t (id INT, note VARCHAR(20));
 CREATE SCHEMA mcpempty;
+GRANT SELECT ON mcpempty.* TO mcpuser@'127.0.0.1';
 empty_no_matching_rows_has_columns: PASS
 empty_no_matching_rows_counted: PASS
 empty_table_has_columns: PASS
@@ -82,6 +84,7 @@ unknown_schema_refused_by_list_tables: PASS
 empty_schema_overview_says_none: PASS
 describe_table_on_view: PASS
 empty_aggregate_returns_null_row: PASS
+REVOKE SELECT ON mcpempty.* FROM mcpuser@'127.0.0.1';
 DROP SCHEMA mcpempty;
 DROP TABLE mcpsec.empty_t;
 # --- db_url not configured ---
@@ -119,9 +122,6 @@ SET GLOBAL vsql_mcp.max_rows = 1000;
 SET GLOBAL vsql_mcp.query_timeout = 30;
 SET GLOBAL vsql_mcp.session_ttl = 1800;
 SET GLOBAL vsql_mcp.db_url = '';
-SET GLOBAL vsql_mcp.ssl_cert = '';
-SET GLOBAL vsql_mcp.ssl_key = '';
-SET GLOBAL vsql_mcp.ssl_port = 3143;
 DROP VIEW mcpsec.v_secret;
 DROP VIEW mcpsec.v_leak;
 DROP SCHEMA mcpalt;
