@@ -14,6 +14,12 @@ a connected agent.
 
 ## Requirements
 
+`vsql_mcp` needs VillageSQL 0.0.8 or later. A 0.0.7 server refuses it:
+
+```
+ERROR 3219 (HY000): Failed to load VEF extension 'vsql_mcp': no matching ABI version for capability 'vsql::sys_var' (extension requires ver-2 + descriptor ver-1)
+```
+
 `vsql_mcp` uses the VEF preview capabilities `thread_worker`, `sys_var`,
 `status_var`, and `sql_query`, so the server must allow preview extensions:
 
