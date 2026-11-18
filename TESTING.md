@@ -1,7 +1,7 @@
 # Testing vsql_mcp
 
 The suite drives the running MCP server with a small Python client and asserts
-the protocol, the six tools, the guardrails, auth, session lifecycle, the
+the protocol, the tools, the guardrails, auth, session lifecycle, the
 transport rules, and the status counters.
 
 ## Prerequisites
@@ -55,8 +55,8 @@ cleanup; it prints one deterministic `check: PASS` line per assertion.
 
 ## Test files
 
-`mcp_basic` walks the happy paths. The other five files are the adversarial
-layer on top of it, split by domain.
+`mcp_basic` walks the happy paths. The other files are the adversarial layer
+on top of it, split by domain.
 
 | File | Covers |
 |---|---|
@@ -64,6 +64,7 @@ layer on top of it, split by domain.
 | `t/mcp_security.test` | Statement-classification evasion (comments, version comments, multi-statement, DDL, `HANDLER`/`DO`/`SET`/`CALL`, `INTO OUTFILE`), which layer catches what, schema-scope evasion, table-allowlist evasion, bearer auth, Origin/DNS-rebinding, session forging, both `write` tool states, and that credentials never appear in a response |
 | `t/mcp_protocol.test` | Spec revision `2025-06-18`: initialize negotiation, structural validation of every advertised `inputSchema`, `tools/call` argument handling, the `vsql://` resource surface including traversal, JSON-RPC framing errors and their codes, and the transport rules |
 | `t/mcp_errors.test` | Engine errors as tool results, the read and write timeout paths, empty states, and every `db_url` misconfiguration |
+| `t/mcp_ddl.test` | The `ddl` tool: hidden and refused while `allow_ddl` is OFF, each accepted form, refusal of every other statement (databases, users, grants, views, procedures, `TRUNCATE`, a second statement, comments that hide a word), the `db_url` account's grants, `schema` scoping, and `allowed_tables` |
 | `t/mcp_types.test` | Round-trip fidelity for `DECIMAL`, 64-bit integers, `DOUBLE`, temporal types with fractional seconds, `JSON`, `BLOB`/`VARBINARY`/`BIT`/`GEOMETRY`, `ENUM`/`SET`, `utf8mb4`, `NULL`, multi-megabyte cells, and server-side `max_rows` truncation |
 | `t/mcp_concurrency.test` | 50-way fan-out with no crossed responses, loopback connection accounting, mixed fast/timing-out load, disabling the listener with a call in flight, 12 enable/disable cycles, which settings apply without a rebind, and exact status-counter deltas |
 | `t/mcp_tls.test` | A full MCP session over HTTPS, the guardrails on the TLS listener, both listeners serving at once, and the fail-closed paths when certificate material is missing or unreadable. Generates a self-signed certificate per run under `$MYSQL_TMP_DIR` (needs `openssl` on PATH) and removes it afterwards |

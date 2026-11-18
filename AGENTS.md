@@ -31,7 +31,7 @@ sets this via `mysql-test/t/mcp_basic-master.opt`).
 | `src/status.rs` | `SHOW STATUS` counters via the `status_var` capability |
 | `src/httpd.rs` | HTTP transport: listener lifecycle, status codes, auth, Origin, sessions |
 | `src/mcp.rs` | JSON-RPC layer: protocol constants, session store, method dispatch |
-| `src/tools.rs` | The six MCP tools |
+| `src/tools.rs` | The built-in MCP tools |
 | `src/resources.rs` | The `vsql://` resources |
 | `src/guardrails.rs` | Statement classification, schema scoping, table-allowlist checks |
 | `src/executor.rs` | `QueryExecutor` trait + the loopback client implementation |

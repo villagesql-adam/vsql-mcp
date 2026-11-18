@@ -13,15 +13,20 @@ use crate::executor::{self, col, QueryExecutor};
 use crate::guardrails::{self, StmtKind};
 use crate::{mcp, status};
 
-/// The advertised tool list with input schemas. `write` is advertised only when
-/// it is usable: a tool an agent can see is one it will plan around, and
-/// discovering the refusal by attempting a mutation is a wasted turn.
+/// The advertised tool list with input schemas. `write` and `ddl` are
+/// advertised only when they are usable: a tool an agent can see is one it will
+/// plan around, and discovering the refusal by attempting a mutation is a
+/// wasted turn.
 pub fn list(cfg: &RequestConfig) -> Json {
     let mut listing = tool_definitions();
-    if !cfg.allow_write {
-        if let Some(tools) = listing["tools"].as_array_mut() {
-            tools.retain(|t| t.get("name").and_then(Json::as_str) != Some("write"));
-        }
+    if let Some(tools) = listing["tools"].as_array_mut() {
+        tools.retain(|t| match t.get("name").and_then(Json::as_str) {
+            Some("write") => cfg.allow_write,
+            // The allowlist is enforced by planning a statement with EXPLAIN,
+            // and DDL cannot be planned, so ddl is off while a list is set.
+            Some("ddl") => cfg.allow_ddl && cfg.allowed_tables.is_empty(),
+            _ => true,
+        });
     }
     listing
 }
@@ -80,6 +85,15 @@ fn tool_definitions() -> Json {
                     "properties": { "sql": { "type": "string" } },
                     "required": ["sql"]
                 }
+            },
+            {
+                "name": "ddl",
+                "description": "Run one CREATE/ALTER/DROP/RENAME TABLE or CREATE/DROP INDEX statement (requires vsql_mcp.allow_ddl=ON).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "sql": { "type": "string" } },
+                    "required": ["sql"]
+                }
             }
         ]
     })
@@ -99,6 +113,7 @@ pub fn call(params: &Json, id: &Json, cfg: &RequestConfig, exec: &dyn QueryExecu
         "query" => query(args, cfg, exec),
         "explain" => explain(args, cfg, exec),
         "write" => write(args, cfg, exec),
+        "ddl" => ddl(args, cfg, exec),
         other => Err(format!("unknown tool: {other}")),
     };
 
@@ -274,6 +289,35 @@ fn write(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<J
     Ok(json!({ "affected_rows": affected }))
 }
 
+fn ddl(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Json, String> {
+    if !cfg.allow_ddl {
+        return Err("the ddl tool is disabled (set vsql_mcp.allow_ddl = ON)".to_owned());
+    }
+    if !cfg.allowed_tables.is_empty() {
+        return Err(
+            "the ddl tool cannot be used while vsql_mcp.allowed_tables is set, \
+                    because the allowlist cannot check a DDL statement"
+                .to_owned(),
+        );
+    }
+    let sql = arg_str(args, "sql")?;
+    if !guardrails::is_allowed_ddl(sql) {
+        return Err(
+            "the ddl tool accepts a single CREATE, ALTER, DROP or RENAME TABLE, \
+                    or CREATE or DROP INDEX statement"
+                .to_owned(),
+        );
+    }
+    if let Some(bad) = guardrails::ddl_schema_violation(sql, &cfg.schema) {
+        return Err(outside_schema(&bad, cfg));
+    }
+    // The db_url account's grants decide which schemas this can change; the
+    // write session's KILL watchdog bounds it, since MAX_EXECUTION_TIME does
+    // not apply to DDL.
+    let affected = exec.write_one(sql, cfg.query_timeout)?;
+    Ok(json!({ "affected_rows": affected }))
+}
+
 /// Enforce schema scoping and the table allowlist for a statement that is about
 /// to run. Uses EXPLAIN FORMAT=JSON to learn which tables the optimizer will
 /// actually touch, so joins and subqueries are covered.
@@ -284,11 +328,7 @@ fn check_access(sql: &str, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Res
         ));
     }
     if let Some(bad) = guardrails::schema_violation(sql, &cfg.schema) {
-        return Err(format!(
-            "schema '{bad}' is outside the exposed schema; only '{}' is \
-             available, and a bare table name resolves inside it",
-            cfg.schema
-        ));
+        return Err(outside_schema(&bad, cfg));
     }
     if !cfg.schema.is_empty() && guardrails::show_outside_schema(sql) {
         return Err(format!(
@@ -336,6 +376,17 @@ fn check_access(sql: &str, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Res
         }
     }
     Ok(())
+}
+
+/// Say what to do about a reference outside the exposed schema: the loopback
+/// session has no default database, so the way out is to qualify with the
+/// exposed schema, not to drop the qualifier.
+fn outside_schema(bad: &str, cfg: &RequestConfig) -> String {
+    format!(
+        "schema '{bad}' is outside the exposed schema; only '{}' is \
+         available, and a bare table name resolves inside it",
+        cfg.schema
+    )
 }
 
 /// Run EXPLAIN FORMAT=JSON and parse the single JSON cell it returns.

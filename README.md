@@ -166,12 +166,12 @@ front of the endpoint.
 
 ## How queries run
 
-Three of the six tools — `list_schemas`, `list_tables`, and `describe_table` —
+Three of the seven tools — `list_schemas`, `list_tables`, and `describe_table` —
 plus the `vsql://<schema>` resource listing run in-process, via the
 `sql_query` capability. Their column layout is fixed in the extension's own
 code, so no round trip is needed to name or type a result.
 
-Everything else — the `query` tool's arbitrary SQL, the `write` tool, EXPLAIN,
+Everything else — the `query` tool's arbitrary SQL, the `write` and `ddl` tools, EXPLAIN,
 and `SHOW CREATE TABLE` (behind the `vsql://<schema>/<table>` resource) — runs
 through a **loopback client connection** to the server, configured by
 `vsql_mcp.db_url`. `sql_query` cannot host these: as of this SDK version it
@@ -201,6 +201,7 @@ All variables are `SET GLOBAL vsql_mcp.<name>`.
 | `require_auth` | OFF | Require a bearer token on every request |
 | `bearer_token` | `""` | Static token checked when `require_auth` is ON |
 | `allow_write` | OFF | Enable the `write` tool |
+| `allow_ddl` | OFF | Enable the `ddl` tool |
 | `allowed_tables` | `""` | Comma-separated table allowlist; empty means all |
 | `max_rows` | 1000 | Row cap per `query` result |
 | `query_timeout` | 30 | Per-tool-call statement timeout (seconds) |
@@ -215,7 +216,7 @@ Port and TLS changes take effect when the server is next enabled — toggle
 
 ## Tools
 
-The server advertises six tools via `tools/list`:
+The server advertises seven tools via `tools/list`:
 
 | Tool | Purpose |
 |---|---|
@@ -225,9 +226,11 @@ The server advertises six tools via `tools/list`:
 | `query` | Run a single read-only `SELECT` and return JSON rows |
 | `explain` | `EXPLAIN FORMAT=JSON` for a candidate query |
 | `write` | One `INSERT`/`UPDATE`/`DELETE`/`REPLACE` (requires `allow_write = ON`) |
+| `ddl` | One `CREATE`/`ALTER`/`DROP`/`RENAME TABLE` or `CREATE`/`DROP INDEX` (requires `allow_ddl = ON`) |
 
-`write` is advertised in `tools/list` only while `allow_write` is ON, so an
-agent never plans around a tool it cannot use.
+`write` is advertised in `tools/list` only while `allow_write` is ON, and `ddl`
+only while `allow_ddl` is ON and `allowed_tables` is empty, so an agent never
+plans around a tool it cannot use.
 
 Tool results follow the MCP shape: a `content` array with a JSON text block,
 plus `isError`. A rejected statement returns `isError: true` with a message
@@ -238,9 +241,48 @@ refused with:
 only a single read-only statement is allowed by the query tool
 ```
 
+### Schema changes
+
+The `ddl` tool lets an agent run a migration without a MySQL client. It accepts
+one statement of these forms, and refuses every other statement:
+
+- `CREATE TABLE`, `CREATE TEMPORARY TABLE`, `ALTER TABLE`, `DROP TABLE`,
+  `RENAME TABLE`
+- `CREATE INDEX` (also `UNIQUE`, `FULLTEXT`, `SPATIAL`), `DROP INDEX`
+
+It does not create or drop a database, a view, a user, a grant, a stored
+program, or a trigger, and it does not run `TRUNCATE` or any statement with a
+`TABLESPACE` clause, such as `ALTER TABLE ... DISCARD TABLESPACE`. A `DROP DATABASE` sent
+to it is refused with:
+
+```
+the ddl tool accepts a single CREATE, ALTER, DROP or RENAME TABLE, or CREATE or DROP INDEX statement
+```
+
+The statement runs over the `db_url` connection, so the account's grants decide
+which schemas the tool can change. Grant `CREATE`, `ALTER`, `DROP`, and `INDEX`
+only on the schemas that agents may change, and do not grant `FILE`: without
+it, the server refuses a `DATA DIRECTORY` clause. A statement outside those grants
+reaches the server and fails there:
+
+```
+ERROR 1142 (42000): CREATE command denied to user 'mcp'@'localhost' for table 'x'
+```
+
+`schema` scoping applies to `ddl` as it does to `write`. While `allowed_tables`
+is set, `ddl` is not listed and a call to it is refused: the allowlist is
+checked by planning a statement with `EXPLAIN`, which cannot plan DDL.
+
+Comments are allowed before the statement, such as a `-- migration 12` line.
+After the statement starts, a comment, a double quote, or a backslash refuses
+it, and so does a `/*! */` comment anywhere. The statement is sent as a
+prepared statement, which the server runs as exactly one statement, so text
+after a `;` is a syntax error and never a second statement.
+
 ### Guardrails
 
-Applied to every `query`, `explain`, and `write` call:
+Applied to every `query`, `explain`, and `write` call (and to `ddl` as described
+in [Schema changes](#schema-changes)):
 
 - **Read-only enforcement.** `query` accepts a single `SELECT`/`SHOW`/`WITH`/
   `EXPLAIN`/`DESCRIBE`; the loopback session is also set `READ ONLY`. `write`
@@ -369,7 +411,7 @@ as a security boundary:
 - Bind is `127.0.0.1` only; front it with a reverse proxy if you need remote
   access, and terminate TLS there or via `ssl_cert`/`ssl_key`.
 - Give `db_url` a least-privilege account. Read-only is enough unless you enable
-  the `write` tool, and the account's `GRANT`s are the real access control.
+  the `write` or `ddl` tool, and the account's `GRANT`s are the real access control.
 - Keep `require_auth` ON for anything beyond a local experiment, and prefer a
   proxy that maps identities over the single static token.
 - `allowed_tables` and `schema` narrow what an agent can reach even within the
