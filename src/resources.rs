@@ -145,6 +145,6 @@ fn schema_overview(schema: &str, cfg: &RequestConfig, exec: &dyn QueryExecutor) 
 }
 
 /// Backtick-quote an identifier, doubling any embedded backtick.
-fn quote_ident(ident: &str) -> String {
+pub(crate) fn quote_ident(ident: &str) -> String {
     format!("`{}`", ident.replace('`', "``"))
 }

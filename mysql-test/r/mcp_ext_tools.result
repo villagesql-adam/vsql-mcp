@@ -1,0 +1,99 @@
+INSTALL EXTENSION vsql_mcp;
+CREATE USER mcpuser@'127.0.0.1';
+GRANT SELECT, SHOW VIEW ON *.* TO mcpuser@'127.0.0.1';
+CREATE SCHEMA mcpsec;
+GRANT INSERT, UPDATE, DELETE ON mcpsec.* TO mcpuser@'127.0.0.1';
+CREATE TABLE mcpsec.t1 (id INT PRIMARY KEY, name VARCHAR(50));
+INSERT INTO mcpsec.t1 VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+CREATE TABLE mcpsec.secret (id INT PRIMARY KEY, password_hash VARCHAR(80), KEY ix_ph (password_hash));
+INSERT INTO mcpsec.secret VALUES (1, 'hunter2hash');
+CREATE SCHEMA mcpalt;
+CREATE TABLE mcpalt.t1 (id INT PRIMARY KEY, tag VARCHAR(30));
+INSERT INTO mcpalt.t1 VALUES (1, 'other-schema-row');
+CREATE VIEW mcpsec.v_leak AS SELECT id, tag FROM mcpalt.t1;
+CREATE VIEW mcpsec.v_secret AS SELECT password_hash FROM mcpsec.secret;
+SET GLOBAL vsql_mcp.port = 0;
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = ON;
+INSTALL EXTENSION mcp_tooltest;
+read_tool_listed: PASS
+write_tool_hidden: PASS
+builtins_listed: PASS
+read_tool_args_bound: PASS
+read_tool_no_args: PASS
+read_tool_error_text: PASS
+read_tool_null_refused: PASS
+quoted_name_unknown: PASS
+write_tool_refused: PASS
+SET GLOBAL vsql_mcp.allow_write = ON;
+write_tool_listed: PASS
+write_tool_runs: PASS
+SET GLOBAL vsql_mcp.allow_write = OFF;
+# The quoted tool name above never reached the registration query.
+Pattern "could not read extension registrations" not found
+# Not JSON.
+SELECT mcp_tooltest.set_manifest('not json');
+mcp_tooltest.set_manifest('not json')
+1
+broken_tools_dropped: PASS
+broken_builtins_listed: PASS
+broken_call_refused: PASS
+Pattern "ignoring the MCP tools of extension 'mcp_tooltest': mcp_tools\(\) did not return a JSON array" found
+# A tool with no handler.
+SELECT mcp_tooltest.set_manifest('[{"name": "echo", "description": "d", "inputSchema": {"type": "object"}, "handler": "echo_args", "kind": "read"}, {"name": "nohandler", "description": "d", "inputSchema": {"type": "object"}, "kind": "read"}]');
+mcp_tooltest.set_manifest('[{"name": "echo", "description": "d", "inputSchema": {"type": "object"}, "handler": "echo_args", "kind": "read"}, {"name": "nohandler", "description": "d", "inputSchema": {"type": "object"}, "kind": "read"}]')
+1
+broken_tools_dropped: PASS
+broken_builtins_listed: PASS
+broken_call_refused: PASS
+Pattern "ignoring the MCP tools of extension 'mcp_tooltest': a tool has no string field "handler"" found
+# A handler that another extension, vsql_mcp, registers.
+SELECT mcp_tooltest.set_manifest('[{"name": "echo", "description": "d", "inputSchema": {"type": "object"}, "handler": "info", "kind": "read"}]');
+mcp_tooltest.set_manifest('[{"name": "echo", "description": "d", "inputSchema": {"type": "object"}, "handler": "info", "kind": "read"}]')
+1
+broken_tools_dropped: PASS
+broken_builtins_listed: PASS
+broken_call_refused: PASS
+Pattern "handler 'info' is not a function extension 'mcp_tooltest' registers" found
+# A kind that is neither read nor write.
+SELECT mcp_tooltest.set_manifest('[{"name": "echo", "description": "d", "inputSchema": {"type": "object"}, "handler": "echo_args", "kind": "admin"}]');
+mcp_tooltest.set_manifest('[{"name": "echo", "description": "d", "inputSchema": {"type": "object"}, "handler": "echo_args", "kind": "admin"}]')
+1
+broken_tools_dropped: PASS
+broken_builtins_listed: PASS
+broken_call_refused: PASS
+Pattern "kind 'admin' is not 'read' or 'write'" found
+SELECT mcp_tooltest.set_manifest(NULL);
+mcp_tooltest.set_manifest(NULL)
+1
+read_tool_listed: PASS
+write_tool_hidden: PASS
+builtins_listed: PASS
+read_tool_args_bound: PASS
+read_tool_no_args: PASS
+read_tool_error_text: PASS
+read_tool_null_refused: PASS
+quoted_name_unknown: PASS
+write_tool_refused: PASS
+UNINSTALL EXTENSION mcp_tooltest;
+uninstalled_tools_gone: PASS
+uninstalled_call_refused: PASS
+SET GLOBAL vsql_mcp.vsql_mcp_enabled = OFF;
+SET GLOBAL vsql_mcp.schema = '';
+SET GLOBAL vsql_mcp.allowed_tables = '';
+SET GLOBAL vsql_mcp.allow_write = OFF;
+SET GLOBAL vsql_mcp.allow_ddl = OFF;
+SET GLOBAL vsql_mcp.require_auth = OFF;
+SET GLOBAL vsql_mcp.bearer_token = '';
+SET GLOBAL vsql_mcp.max_rows = 1000;
+SET GLOBAL vsql_mcp.query_timeout = 30;
+SET GLOBAL vsql_mcp.session_ttl = 1800;
+SET GLOBAL vsql_mcp.db_url = '';
+SET GLOBAL vsql_mcp.ssl_cert = '';
+SET GLOBAL vsql_mcp.ssl_key = '';
+SET GLOBAL vsql_mcp.ssl_port = 3143;
+DROP VIEW mcpsec.v_secret;
+DROP VIEW mcpsec.v_leak;
+DROP SCHEMA mcpalt;
+DROP SCHEMA mcpsec;
+DROP USER mcpuser@'127.0.0.1';
+UNINSTALL EXTENSION vsql_mcp;

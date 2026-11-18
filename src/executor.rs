@@ -80,6 +80,19 @@ pub trait QueryExecutor {
     /// for multi-statement support.
     fn write_one(&self, sql: &str, timeout_s: u64) -> Result<u64, String>;
 
+    /// Run one `SELECT` of a function call with positional parameters and
+    /// return its first row. With `read_only`, the session is the read-only,
+    /// time-limited one `read` uses; without it, the session can write and is
+    /// bounded the way `write` is. Always over the `db_url` connection, so the
+    /// function runs as that account.
+    fn call_function(
+        &self,
+        sql: &str,
+        params: Vec<MyValue>,
+        read_only: bool,
+        timeout_s: u64,
+    ) -> Result<Rows, String>;
+
     /// Run a read-only statement with positional parameters, returning all
     /// rows keyed by `columns` — which the caller must give in the exact
     /// order its `sql`'s select list names them, since the native path (see
@@ -270,13 +283,13 @@ impl QueryExecutor for Loopback<'_> {
     fn read(&self, sql: &str, max_rows: usize, timeout_s: u64) -> Result<Rows, String> {
         let mut conn = self.read_conn(timeout_s, Some(max_rows))?;
         let result = conn.exec_iter(sql, ()).map_err(map_err)?;
-        collect(result, max_rows)
+        collect(result, max_rows).map_err(map_err)
     }
 
     fn read_text(&self, sql: &str, max_rows: usize, timeout_s: u64) -> Result<Rows, String> {
         let mut conn = self.read_conn(timeout_s, None)?;
         let result = conn.query_iter(sql).map_err(map_err)?;
-        collect(result, max_rows)
+        collect(result, max_rows).map_err(map_err)
     }
 
     fn write(&self, sql: &str, timeout_s: u64) -> Result<u64, String> {
@@ -285,6 +298,30 @@ impl QueryExecutor for Loopback<'_> {
 
     fn write_one(&self, sql: &str, timeout_s: u64) -> Result<u64, String> {
         self.bounded_write(sql, timeout_s, true)
+    }
+
+    fn call_function(
+        &self,
+        sql: &str,
+        params: Vec<MyValue>,
+        read_only: bool,
+        timeout_s: u64,
+    ) -> Result<Rows, String> {
+        if read_only {
+            let mut conn = self.read_conn(timeout_s, Some(1))?;
+            let result = conn.exec_iter(sql, params).map_err(map_err)?;
+            return collect(result, 1).map_err(map_err);
+        }
+        // A writing function gets the write tool's session: not read-only, and
+        // stopped by the KILL watchdog rather than MAX_EXECUTION_TIME.
+        let mut conn = self.connect(timeout_s.saturating_add(READ_TIMEOUT_HEADROOM_S))?;
+        let watchdog = self.spawn_kill_watchdog(&mut conn, timeout_s);
+        let outcome = conn
+            .exec_iter(sql, params)
+            .and_then(|result| collect(result, 1))
+            .map_err(map_write_err);
+        drop(watchdog);
+        outcome
     }
 
     fn read_params(
@@ -299,7 +336,7 @@ impl QueryExecutor for Loopback<'_> {
         // docs) is redundant here and ignored.
         let mut conn = self.read_conn(timeout_s, None)?;
         let result = conn.exec_iter(sql, params).map_err(map_err)?;
-        collect(result, usize::MAX)
+        collect(result, usize::MAX).map_err(map_err)
     }
 }
 
@@ -397,10 +434,12 @@ const ER_BAD_DB_ERROR: u16 = 1049;
 
 /// Drain a query result into JSON, capping at `max_rows`. When more rows exist
 /// than the cap, `truncated` is set and the surplus is consumed and discarded.
+/// An error raised while rows are read is returned as the driver's own, so the
+/// caller renders it the same way as an error from starting the statement.
 fn collect<T: Protocol>(
     mut result: mysql::QueryResult<'_, '_, '_, T>,
     max_rows: usize,
-) -> Result<Rows, String> {
+) -> Result<Rows, mysql::Error> {
     // Keep the column metadata, not just the names: how a value should be
     // rendered depends on the column's declared type, and the row itself does
     // not carry it.
@@ -410,7 +449,9 @@ fn collect<T: Protocol>(
     let mut rows = Vec::new();
     let mut truncated = false;
     for row in result.by_ref() {
-        let row = row.map_err(|e| e.to_string())?;
+        // A function that fails does so here, while its row is read, not when
+        // the statement starts.
+        let row = row?;
         if rows.len() >= max_rows {
             truncated = true;
             // Keep draining so the connection is left in a clean state. With a
@@ -663,6 +704,17 @@ impl QueryExecutor for Hybrid<'_> {
 
     fn write_one(&self, sql: &str, timeout_s: u64) -> Result<u64, String> {
         self.loopback.write_one(sql, timeout_s)
+    }
+
+    fn call_function(
+        &self,
+        sql: &str,
+        params: Vec<MyValue>,
+        read_only: bool,
+        timeout_s: u64,
+    ) -> Result<Rows, String> {
+        self.loopback
+            .call_function(sql, params, read_only, timeout_s)
     }
 
     fn read_params(
