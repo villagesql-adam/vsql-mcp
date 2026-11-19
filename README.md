@@ -363,6 +363,41 @@ worker tries to bind the listener on its next wakeup, which comes every 25 ms,
 so a call right after `vsql_mcp_enabled` is set can report `"starting": true`
 with `"enabled": false`.
 
+## Troubleshooting
+
+Each error below is what a tool call returns to the agent.
+
+```
+vsql_mcp.db_url is not set
+```
+
+Set `vsql_mcp.db_url` to the account that tool queries run as. See
+[Quick start](#quick-start).
+
+```
+the vsql_mcp.db_url account root@localhost holds INSERT, UPDATE, DELETE, CREATE, DROP and 64 more on every database; grant it privileges on the exposed schema or tables only
+```
+
+The `db_url` account can reach every database. Create a dedicated account with
+grants on the exposed schema only, as in [Quick start](#quick-start), and point
+`db_url` at it.
+
+```
+vsql_mcp.schema 'mydb' does not exist, or the db_url account has no grant on it
+```
+
+Check the spelling of `vsql_mcp.schema`, then grant the `db_url` account access
+to that schema.
+
+```
+loopback connect failed: ERROR 1045 (28000): Access denied for user 'mcp'@'localhost' (using password: YES)
+```
+
+The user name or password in `db_url` is wrong.
+
+For the errors that `INSTALL EXTENSION` can return, see
+[Requirements](#requirements).
+
 ## Known Limitations
 
 - **No SSE / server-initiated messages.** `GET /mcp` returns HTTP 405, which the
