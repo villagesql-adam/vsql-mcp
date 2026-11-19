@@ -17,9 +17,6 @@ SET GLOBAL vsql_mcp.max_rows = 1000;
 SET GLOBAL vsql_mcp.query_timeout = 30;
 SET GLOBAL vsql_mcp.session_ttl = 1800;
 SET GLOBAL vsql_mcp.db_url = '';
-SET GLOBAL vsql_mcp.ssl_cert = '';
-SET GLOBAL vsql_mcp.ssl_key = '';
-SET GLOBAL vsql_mcp.ssl_port = 3143;
 
 DROP VIEW mcpsec.v_secret;
 DROP VIEW mcpsec.v_leak;

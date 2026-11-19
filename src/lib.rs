@@ -1,12 +1,12 @@
 // vsql-mcp — expose a VillageSQL database as a Model Context Protocol server.
 // Copyright (C) 2026 VillageSQL. Licensed under GPL-2.0.
 
-//! Entry point: wires the four preview capabilities (thread_worker, sys_var,
-//! status_var, sql_query) to the MCP HTTP server and registers the `info()` VDF.
+//! Entry point: wires the three preview capabilities (thread_worker, sys_var,
+//! status_var) to the MCP HTTP server and registers the `info()` VDF.
 //!
 //! The background worker owns the listener lifecycle. On enable it binds the
 //! configured ports; on each periodic wakeup it drains pending HTTP requests;
-//! on disable it drops the listeners and clears sessions.
+//! on disable it drops the listener and clears sessions.
 
 mod config;
 mod executor;
@@ -22,13 +22,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
-use villagesql::preview::sql_query::SqlQueryCapability;
 use villagesql::preview::thread_worker::{
     NextWakeup, ThreadHandle, ThreadWorkerCapability, WakeupReason,
 };
 use villagesql::{InValue, VdfReturn};
-
-use config::ListenConfig;
 
 /// Reflects whether the server is currently bound, for `info()`.
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -46,7 +43,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The background worker. Runs on the server's worker thread whenever
 /// `vsql_mcp.vsql_mcp_enabled` is ON.
-fn worker(reason: WakeupReason, handle: &ThreadHandle) -> NextWakeup {
+fn worker(reason: WakeupReason, _handle: &ThreadHandle) -> NextWakeup {
     match reason {
         WakeupReason::Enable => {
             // Defer the actual bind: see PENDING_START above. No get(), no bind.
@@ -60,15 +57,14 @@ fn worker(reason: WakeupReason, handle: &ThreadHandle) -> NextWakeup {
         // a queue pop every 25ms, which is negligible beside a SQL round trip.
         WakeupReason::Periodic | WakeupReason::PollFd => {
             if PENDING_START.swap(false, Ordering::Relaxed) {
-                let cfg = ListenConfig::read();
                 // Reflect what actually happened: if the HTTP listener did not
                 // bind (port in use, say), nothing is serving, so `info()` and
                 // the status vars must not report an enabled server. A re-toggle
                 // of vsql_mcp_enabled retries; auto-retrying here would spin.
-                let bound = httpd::start(&cfg);
+                let bound = httpd::start(config::port());
                 ENABLED.store(bound, Ordering::Relaxed);
             }
-            httpd::poll(handle);
+            httpd::poll();
         }
         WakeupReason::Disable => {
             PENDING_START.store(false, Ordering::Relaxed);
@@ -84,28 +80,16 @@ fn worker(reason: WakeupReason, handle: &ThreadHandle) -> NextWakeup {
 static WORKER: ThreadWorkerCapability =
     ThreadWorkerCapability::new(worker, "vsql_mcp", POLL_INTERVAL, None);
 
-/// The `sql_query` capability. `httpd::handle_post` opens a session on it per
-/// request for the tool calls that can run in-process — see `executor::Hybrid`.
-/// `query` and `write` still go through the loopback connection in
-/// `vsql_mcp.db_url`: `sql_query` (as of this SDK version) reports no column
-/// names or types, so it cannot reproduce the query tool's typed, name-keyed
-/// output, and a session cannot be reached from outside the worker thread that
-/// opened it, so it cannot host the KILL-based write timeout either.
-pub(crate) static SQL_QUERY: SqlQueryCapability = SqlQueryCapability::new();
-
 /// SQL: `vsql_mcp.info()` -> STRING (JSON). A liveness probe callable without a
 /// database, so tests can assert server state without an HTTP round-trip.
 fn info_impl(_args: &[InValue]) -> VdfReturn {
-    let (port, ssl_port) = config::port_settings();
     let summary = json!({
         "enabled": ENABLED.load(Ordering::Relaxed),
         // True between `vsql_mcp_enabled = ON` and the bind attempt on the next
         // Periodic wakeup, so a caller can tell "not up yet" from "off".
         "starting": PENDING_START.load(Ordering::Relaxed),
-        "port": port,
-        "ssl_port": ssl_port,
+        "port": config::port(),
         "http_port": status::http_port(),
-        "https_port": status::https_port(),
         "schema": config::schema_setting(),
         "sessions_active": status::sessions_active(),
         "protocol_version": mcp::PROTOCOL_VERSION
@@ -121,6 +105,5 @@ villagesql::extension! {
         &WORKER,
         &config::SYS_VAR,
         &status::STATUS_VAR,
-        &SQL_QUERY,
     ]
 }

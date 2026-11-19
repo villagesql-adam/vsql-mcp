@@ -9,12 +9,10 @@
 
 INSTALL EXTENSION vsql_mcp;
 
-# A dedicated loopback account the extension runs tool queries as. Broad SELECT
-# so the guardrails — not privilege errors — are what reject out-of-scope
-# tables; write grants only on the test schema.
+# A dedicated loopback account the extension runs tool queries as, with
+# privileges on the test schema only.
 CREATE USER mcpuser@'127.0.0.1';
-GRANT SELECT ON *.* TO mcpuser@'127.0.0.1';
-GRANT INSERT, UPDATE, DELETE ON mcptest.* TO mcpuser@'127.0.0.1';
+GRANT SELECT, INSERT, UPDATE, DELETE ON mcptest.* TO mcpuser@'127.0.0.1';
 
 CREATE SCHEMA mcptest;
 CREATE TABLE mcptest.t1 (id INT PRIMARY KEY, name VARCHAR(50));

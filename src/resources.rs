@@ -6,7 +6,7 @@
 use serde_json::{json, Value as Json};
 
 use crate::config::RequestConfig;
-use crate::executor::{self, QueryExecutor};
+use crate::executor::{self, Loopback};
 use crate::mcp;
 
 /// Advertise resources: one per exposed schema plus one per table. When no
@@ -15,7 +15,7 @@ use crate::mcp;
 ///
 /// A failed introspection query surfaces as an error rather than an empty list:
 /// a broken `db_url` and a server with no schemas must not read the same.
-pub fn list(cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Json, String> {
+pub fn list(cfg: &RequestConfig, exec: &Loopback) -> Result<Json, String> {
     let mut resources = Vec::new();
     let schemas: Vec<String> = if cfg.schema.is_empty() {
         executor::schema_names(exec, cfg.query_timeout)?
@@ -34,12 +34,8 @@ pub fn list(cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Json, Strin
 
     // When a single schema is exposed, also enumerate its tables.
     if !cfg.schema.is_empty() {
-        let rows = executor::tables_in_schema(exec, &cfg.schema, cfg.query_timeout)?;
-        for row in &rows.rows {
+        for row in executor::visible_tables(exec, &cfg.schema, cfg)? {
             if let Some(table) = row.get("TABLE_NAME").and_then(Json::as_str) {
-                if !crate::guardrails::table_allowed(table, &cfg.allowed_tables) {
-                    continue;
-                }
                 resources.push(json!({
                     "uri": format!("vsql://{}/{table}", cfg.schema),
                     "name": format!("{}.{table}", cfg.schema),
@@ -54,7 +50,7 @@ pub fn list(cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Json, Strin
 }
 
 /// Handle `resources/read` and return a full JSON-RPC response.
-pub fn read(params: &Json, id: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Json {
+pub fn read(params: &Json, id: &Json, cfg: &RequestConfig, exec: &Loopback) -> Json {
     let uri = match params.get("uri").and_then(Json::as_str) {
         Some(u) => u,
         None => return mcp::error(id, -32602, "missing required parameter: uri"),
@@ -70,7 +66,7 @@ pub fn read(params: &Json, id: &Json, cfg: &RequestConfig, exec: &dyn QueryExecu
     }
 }
 
-fn read_uri(uri: &str, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<String, String> {
+fn read_uri(uri: &str, cfg: &RequestConfig, exec: &Loopback) -> Result<String, String> {
     let rest = uri
         .strip_prefix("vsql://")
         .ok_or_else(|| format!("unsupported resource URI: {uri}"))?;
@@ -89,18 +85,16 @@ fn read_uri(uri: &str, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<
         Some(table) if !table.is_empty() => {
             // A table's DDL is as much a disclosure as its rows, so the
             // allowlist applies here exactly as it does to the query tool.
-            if !crate::guardrails::table_allowed(table, &cfg.allowed_tables) {
-                return Err(format!("table '{table}' is not in vsql_mcp.allowed_tables"));
-            }
+            crate::guardrails::check_table(table, &cfg.allowed_tables)?;
             table_ddl(schema, table, cfg, exec)
         }
         _ => schema_overview(schema, cfg, exec),
     }
 }
 
-fn table_ddl(schema: &str, table: &str, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<String, String> {
+fn table_ddl(schema: &str, table: &str, cfg: &RequestConfig, exec: &Loopback) -> Result<String, String> {
     let sql = format!("SHOW CREATE TABLE {}.{}", quote_ident(schema), quote_ident(table));
-    let rows = exec.read_text(&sql, 1, cfg.query_timeout)?;
+    let rows = exec.read_params(&sql, vec![], cfg.query_timeout)?;
     rows.rows
         .first()
         .and_then(|r| r.get("Create Table").or_else(|| r.get("Create View")))
@@ -109,30 +103,10 @@ fn table_ddl(schema: &str, table: &str, cfg: &RequestConfig, exec: &dyn QueryExe
         .ok_or_else(|| format!("no DDL for {schema}.{table}"))
 }
 
-fn schema_overview(schema: &str, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<String, String> {
-    let rows = executor::tables_in_schema(exec, schema, cfg.query_timeout)?;
-    // The overview enumerates table names, so it is bound by the same allowlist
-    // as list_tables and resources/list: an excluded table is simply not shown,
-    // never revealed as existing. Filter through the one shared predicate.
-    let visible: Vec<&Json> = rows
-        .rows
-        .iter()
-        .filter(|r| {
-            r.get("TABLE_NAME")
-                .and_then(Json::as_str)
-                .is_some_and(|t| crate::guardrails::table_allowed(t, &cfg.allowed_tables))
-        })
-        .collect();
+fn schema_overview(schema: &str, cfg: &RequestConfig, exec: &Loopback) -> Result<String, String> {
+    let visible = executor::visible_tables(exec, schema, cfg)?;
     let mut out = format!("Schema: {schema}\nTables:\n");
     if visible.is_empty() {
-        // An empty listing and a mistyped name look identical, so a client that
-        // got the name wrong would read a plausible "no tables" answer instead
-        // of a correction. Only pay for the lookup when there is nothing to
-        // report. A schema that exists but shows nothing (all tables excluded,
-        // or genuinely empty) reads as "(none)".
-        if rows.rows.is_empty() && !executor::schema_exists(exec, schema, cfg.query_timeout)? {
-            return Err(format!("no such schema: {schema}"));
-        }
         out.push_str("  (none)\n");
     }
     for row in visible {

@@ -9,12 +9,12 @@ use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{json, Value as Json};
 
 use crate::config::RequestConfig;
-use crate::executor::QueryExecutor;
+use crate::executor::Loopback;
 use crate::{resources, status, tools};
 
 /// Protocol version this server implements and advertises.
@@ -25,15 +25,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 
 /// Versions accepted in the `MCP-Protocol-Version` header. `2025-03-26` is the
 /// value the spec says to assume when the header is absent, so we accept it too.
-pub const SUPPORTED_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26"];
-
-/// A session with no activity for `vsql_mcp.session_ttl` is treated as gone.
-/// MCP clients are supposed to DELETE on exit but often don't, so this bounds
-/// the map. Read through a function rather than held as a constant so the
-/// setting takes effect on the next request.
-fn session_ttl() -> Duration {
-    crate::config::session_ttl()
-}
+pub const SUPPORTED_VERSIONS: &[&str] = &[PROTOCOL_VERSION, "2025-03-26"];
 
 /// Upper bound on live sessions, so a client that keeps calling `initialize`
 /// without ever deleting cannot grow the map without limit before the TTL
@@ -60,7 +52,7 @@ pub fn new_session() -> String {
     let a = seeded_hash(n);
     let b = seeded_hash(n ^ 0x9e37_79b9_7f4a_7c15);
     let id = format!("{a:016x}{b:016x}");
-    let ttl = session_ttl();
+    let ttl = crate::config::session_ttl();
     let mut map = lock_sessions();
     map.retain(|_, seen| seen.elapsed() < ttl);
     // If eviction did not get the map back under the cap (every session still
@@ -79,7 +71,7 @@ pub fn new_session() -> String {
 /// is idle-based — a session in active use never expires under a client — so the
 /// check is also the touch that keeps it alive.
 pub fn session_exists(id: &str) -> bool {
-    let ttl = session_ttl();
+    let ttl = crate::config::session_ttl();
     let mut map = lock_sessions();
     match map.get_mut(id) {
         Some(seen) if seen.elapsed() < ttl => {
@@ -113,14 +105,14 @@ fn seeded_hash(input: u64) -> u64 {
 
 pub fn error(id: &Json, code: i64, message: &str) -> Json {
     json!({
-        "jsonrpc": "2.0",
+        "jsonrpc": JSONRPC_VERSION,
         "id": id,
         "error": { "code": code, "message": message }
     })
 }
 
 pub fn result(id: &Json, value: Json) -> Json {
-    json!({ "jsonrpc": "2.0", "id": id, "result": value })
+    json!({ "jsonrpc": JSONRPC_VERSION, "id": id, "result": value })
 }
 
 /// The `initialize` result: advertised protocol version, capabilities, and
@@ -144,7 +136,7 @@ pub fn initialize_result(id: &Json) -> Json {
 
 /// Route a non-initialize JSON-RPC request to its handler and return a full
 /// JSON-RPC response object.
-pub fn dispatch(method: &str, params: &Json, id: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Json {
+pub fn dispatch(method: &str, params: &Json, id: &Json, cfg: &RequestConfig, exec: &Loopback) -> Json {
     match method {
         "ping" => result(id, json!({})),
         "tools/list" => result(id, tools::list(cfg, exec)),

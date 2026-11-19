@@ -9,7 +9,7 @@ use mysql::Value as MyValue;
 use serde_json::{json, Value as Json};
 
 use crate::config::RequestConfig;
-use crate::executor::{self, col, QueryExecutor};
+use crate::executor::{self, Loopback};
 use crate::guardrails::{self, StmtKind};
 use crate::{ext_tools, mcp, status};
 
@@ -18,7 +18,7 @@ use crate::{ext_tools, mcp, status};
 /// advertised only when they are usable: a tool an agent can see is one it will
 /// plan around, and discovering the refusal by attempting a mutation is a
 /// wasted turn.
-pub fn list(cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Json {
+pub fn list(cfg: &RequestConfig, exec: &Loopback) -> Json {
     let mut listing = tool_definitions();
     if let Some(tools) = listing["tools"].as_array_mut() {
         tools.retain(|t| match t.get("name").and_then(Json::as_str) {
@@ -103,46 +103,41 @@ fn tool_definitions() -> Json {
 
 /// Handle a `tools/call` request. Always counts one tool call; counts one tool
 /// error on any failure path.
-pub fn call(params: &Json, id: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Json {
+pub fn call(params: &Json, id: &Json, cfg: &RequestConfig, exec: &Loopback) -> Json {
     status::inc_tool_calls();
     let name = params.get("name").and_then(Json::as_str).unwrap_or("");
     let args = params.get("arguments").unwrap_or(&Json::Null);
 
     // An extension tool's result is the handler's own text, passed through
     // as-is rather than serialized again as a JSON string.
-    let outcome = match name {
-        "list_schemas" => list_schemas(cfg, exec).map(|v| v.to_string()),
-        "list_tables" => list_tables(args, cfg, exec).map(|v| v.to_string()),
-        "describe_table" => describe_table(args, cfg, exec).map(|v| v.to_string()),
-        "query" => query(args, cfg, exec).map(|v| v.to_string()),
-        "explain" => explain(args, cfg, exec).map(|v| v.to_string()),
-        "write" => write(args, cfg, exec).map(|v| v.to_string()),
-        "ddl" => ddl(args, cfg, exec).map(|v| v.to_string()),
-        _ => ext_tools::call(name, args, cfg, exec),
+    let outcome = match built_in(name, args, cfg, exec) {
+        Some(result) => result.map(|v| v.to_string()),
+        None => ext_tools::call(name, args, cfg, exec),
     };
-
-    match outcome {
-        Ok(text) => mcp::result(id, tool_ok(&text)),
-        Err(msg) => {
-            status::inc_tool_errors();
-            mcp::result(id, tool_err(&msg))
-        }
+    if outcome.is_err() {
+        status::inc_tool_errors();
     }
+    let (text, is_error) = match &outcome {
+        Ok(text) => (text, false),
+        Err(msg) => (msg, true),
+    };
+    mcp::result(
+        id,
+        json!({ "content": [ { "type": "text", "text": text } ], "isError": is_error }),
+    )
 }
 
-/// A successful tool result: one text block.
-fn tool_ok(text: &str) -> Json {
-    json!({
-        "content": [ { "type": "text", "text": text } ],
-        "isError": false
-    })
-}
-
-/// A failed tool result: the message as a text block with `isError` set.
-fn tool_err(message: &str) -> Json {
-    json!({
-        "content": [ { "type": "text", "text": message } ],
-        "isError": true
+/// Run a built-in tool, or return `None` when `name` is not one.
+fn built_in(name: &str, args: &Json, cfg: &RequestConfig, exec: &Loopback) -> Option<Result<Json, String>> {
+    Some(match name {
+        "list_schemas" => list_schemas(cfg, exec),
+        "list_tables" => list_tables(args, cfg, exec),
+        "describe_table" => describe_table(args, cfg, exec),
+        "query" => query(args, cfg, exec),
+        "explain" => explain(args, cfg, exec),
+        "write" => write(args, cfg, exec),
+        "ddl" => ddl(args, cfg, exec),
+        _ => return None,
     })
 }
 
@@ -168,7 +163,7 @@ fn effective_schema(arg: Option<&str>, cfg: &RequestConfig) -> Result<String, St
         .ok_or_else(|| "no schema configured and none supplied".to_owned())
 }
 
-fn list_schemas(cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Json, String> {
+fn list_schemas(cfg: &RequestConfig, exec: &Loopback) -> Result<Json, String> {
     if !cfg.schema.is_empty() {
         return Ok(json!({ "schemas": [cfg.schema] }));
     }
@@ -176,22 +171,10 @@ fn list_schemas(cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Json, S
     Ok(json!({ "schemas": names }))
 }
 
-fn list_tables(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Json, String> {
+fn list_tables(args: &Json, cfg: &RequestConfig, exec: &Loopback) -> Result<Json, String> {
     let schema = effective_schema(args.get("schema").and_then(Json::as_str), cfg)?;
-    let rows = executor::tables_in_schema(exec, &schema, cfg.query_timeout)?;
-    if rows.rows.is_empty() && !executor::schema_exists(exec, &schema, cfg.query_timeout)? {
-        return Err(format!("no such schema: {schema}"));
-    }
-    let tables: Vec<Json> = rows
-        .rows
+    let tables: Vec<Json> = executor::visible_tables(exec, &schema, cfg)?
         .iter()
-        // A listing narrows rather than fails: an excluded table is simply not
-        // offered, so an agent never learns it exists.
-        .filter(|r| {
-            r.get("TABLE_NAME")
-                .and_then(Json::as_str)
-                .is_some_and(|t| guardrails::table_allowed(t, &cfg.allowed_tables))
-        })
         .map(|r| {
             json!({
                 "name": field(r, "TABLE_NAME"),
@@ -203,27 +186,17 @@ fn list_tables(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Re
     Ok(json!({ "schema": schema, "tables": tables }))
 }
 
-fn describe_table(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Json, String> {
+fn describe_table(args: &Json, cfg: &RequestConfig, exec: &Loopback) -> Result<Json, String> {
     let table = arg_str(args, "table")?;
     let schema = effective_schema(args.get("schema").and_then(Json::as_str), cfg)?;
     // The allowlist governs what an agent may learn about, not only what it may
     // read: column names are the discovery half of reaching the data.
-    if !guardrails::table_allowed(table, &cfg.allowed_tables) {
-        return Err(format!("table '{table}' is not in vsql_mcp.allowed_tables"));
-    }
+    guardrails::check_table(table, &cfg.allowed_tables)?;
     let rows = exec.read_params(
         "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT, COLUMN_COMMENT \
          FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
          ORDER BY ORDINAL_POSITION",
         vec![MyValue::from(schema.clone()), MyValue::from(table.to_owned())],
-        &[
-            col("COLUMN_NAME"),
-            col("COLUMN_TYPE"),
-            col("IS_NULLABLE"),
-            col("COLUMN_KEY"),
-            col("COLUMN_DEFAULT"),
-            col("COLUMN_COMMENT"),
-        ],
         cfg.query_timeout,
     )?;
     if rows.rows.is_empty() {
@@ -246,7 +219,7 @@ fn describe_table(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) ->
     Ok(json!({ "schema": schema, "table": table, "columns": columns }))
 }
 
-fn query(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Json, String> {
+fn query(args: &Json, cfg: &RequestConfig, exec: &Loopback) -> Result<Json, String> {
     let sql = arg_str(args, "sql")?;
     if guardrails::classify(sql) != StmtKind::Read {
         return Err("only a single read-only statement is allowed by the query tool".to_owned());
@@ -262,7 +235,7 @@ fn query(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<J
     }))
 }
 
-fn explain(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Json, String> {
+fn explain(args: &Json, cfg: &RequestConfig, exec: &Loopback) -> Result<Json, String> {
     let sql = arg_str(args, "sql")?;
     // Only plan statements that are otherwise runnable by a tool, and hold them
     // to the same schema and allowlist scope as the query/write tools. A write
@@ -280,7 +253,7 @@ fn explain(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result
     explain_json(sql, cfg, exec)
 }
 
-fn write(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Json, String> {
+fn write(args: &Json, cfg: &RequestConfig, exec: &Loopback) -> Result<Json, String> {
     if !cfg.allow_write {
         return Err("the write tool is disabled (set vsql_mcp.allow_write = ON)".to_owned());
     }
@@ -293,7 +266,7 @@ fn write(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<J
     Ok(json!({ "affected_rows": affected }))
 }
 
-fn ddl(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Json, String> {
+fn ddl(args: &Json, cfg: &RequestConfig, exec: &Loopback) -> Result<Json, String> {
     if !cfg.allow_ddl {
         return Err("the ddl tool is disabled (set vsql_mcp.allow_ddl = ON)".to_owned());
     }
@@ -318,14 +291,14 @@ fn ddl(args: &Json, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Jso
     // The db_url account's grants decide which schemas this can change; the
     // write session's KILL watchdog bounds it, since MAX_EXECUTION_TIME does
     // not apply to DDL.
-    let affected = exec.write_one(sql, cfg.query_timeout)?;
+    let affected = exec.write(sql, cfg.query_timeout)?;
     Ok(json!({ "affected_rows": affected }))
 }
 
 /// Enforce schema scoping and the table allowlist for a statement that is about
 /// to run. Uses EXPLAIN FORMAT=JSON to learn which tables the optimizer will
 /// actually touch, so joins and subqueries are covered.
-fn check_access(sql: &str, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<(), String> {
+fn check_access(sql: &str, cfg: &RequestConfig, exec: &Loopback) -> Result<(), String> {
     if let Some(target) = guardrails::file_write_target(sql) {
         return Err(format!(
             "{target} writes to the server filesystem and is not allowed"
@@ -352,11 +325,7 @@ fn check_access(sql: &str, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Res
     if let Some(target) = guardrails::metadata_target(sql) {
         return match target {
             guardrails::MetadataTarget::Table(table) => {
-                if guardrails::table_allowed(&table, &cfg.allowed_tables) {
-                    Ok(())
-                } else {
-                    Err(format!("table '{table}' is not in vsql_mcp.allowed_tables"))
-                }
+                guardrails::check_table(&table, &cfg.allowed_tables)
             }
             guardrails::MetadataTarget::NotTableScoped => Err(format!(
                 "{} cannot be used while vsql_mcp.allowed_tables is set, because \
@@ -375,16 +344,13 @@ fn check_access(sql: &str, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Res
     // allowed.
     let plan = explain_json(sql, cfg, exec)?;
     for table in guardrails::tables_for_allowlist(sql, &plan) {
-        if !guardrails::table_allowed(&table, &cfg.allowed_tables) {
-            return Err(format!("table '{table}' is not in vsql_mcp.allowed_tables"));
-        }
+        guardrails::check_table(&table, &cfg.allowed_tables)?;
     }
     Ok(())
 }
 
-/// Say what to do about a reference outside the exposed schema: the loopback
-/// session has no default database, so the way out is to qualify with the
-/// exposed schema, not to drop the qualifier.
+/// Say what to do about a reference outside the exposed schema: the exposed
+/// schema is the session's default database, so a bare table name works.
 fn outside_schema(bad: &str, cfg: &RequestConfig) -> String {
     format!(
         "schema '{bad}' is outside the exposed schema; only '{}' is \
@@ -394,8 +360,8 @@ fn outside_schema(bad: &str, cfg: &RequestConfig) -> String {
 }
 
 /// Run EXPLAIN FORMAT=JSON and parse the single JSON cell it returns.
-fn explain_json(sql: &str, cfg: &RequestConfig, exec: &dyn QueryExecutor) -> Result<Json, String> {
-    let rows = exec.read_text(&format!("EXPLAIN FORMAT=JSON {sql}"), 10, cfg.query_timeout)?;
+fn explain_json(sql: &str, cfg: &RequestConfig, exec: &Loopback) -> Result<Json, String> {
+    let rows = exec.read_params(&format!("EXPLAIN FORMAT=JSON {sql}"), vec![], cfg.query_timeout)?;
     let cell = rows
         .rows
         .first()

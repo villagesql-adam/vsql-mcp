@@ -78,17 +78,14 @@ def classify():
     rows = C.query_rows(sid, "SELECT 'a;b' AS s")
     C.ok("classify_semicolon_in_string_allowed", rows == [{"s": "a;b"}], rows)
 
-    # The scanner has no backslash-escape rule, so a MySQL-escaped quote
-    # desynchronises it. The desync direction is over-rejection, never
-    # under-rejection, which is the safe way round.
+    # A quote after a backslash ends the string only under NO_BACKSLASH_ESCAPES,
+    # so a statement with one is refused rather than read one way.
     _, err = C.tool(sid, "query", {"sql": "SELECT 'a\\' ; SELECT 2' AS s"})
-    C.rejected("known_backslash_escape_over_rejected", err, REJECT_READONLY)
+    C.rejected("classify_refuses_backslash_before_quote", err, REJECT_READONLY)
 
-    # has_trailing_statement() scans the whole statement for ';' but strips
-    # comments only at the front, so a ';' inside a trailing comment reads as a
-    # second statement. Valid SQL, refused.
-    _, err = C.tool(sid, "query", {"sql": "SELECT 1 AS a -- ;x"})
-    C.rejected("known_semicolon_in_trailing_comment_rejected", err, REJECT_READONLY)
+    # A ';' inside a trailing comment is not a second statement.
+    rows = C.query_rows(sid, "SELECT 1 AS a -- ;x")
+    C.ok("classify_semicolon_in_trailing_comment_allowed", rows == [{"a": 1}], rows)
 
     # classify() splits on whitespace OR '(', so a parenthesised SELECT yields
     # an empty first token and is refused. Valid read-only SQL, refused.
@@ -97,12 +94,12 @@ def classify():
     _, err = C.tool(sid, "query", {"sql": "(SELECT id FROM mcpsec.t1) UNION (SELECT id FROM mcpsec.secret)"})
     C.rejected("known_parenthesised_union_rejected", err, REJECT_READONLY)
 
-    # A MySQL version comment is stripped wholesale by strip_leading(), so what
-    # is classified is not what the server parses. Here that mismatch produces a
-    # syntax error rather than a bypass, because the two halves cannot form two
-    # statements.
+    # The server runs a versioned comment's text or skips it, depending on its
+    # own version, so a statement with one is refused.
     _, err = C.tool(sid, "query", {"sql": "/*!80000 DELETE FROM mcpsec.t1 */ SELECT 1"})
-    C.ok("known_version_comment_reaches_server", "1064" in err, err[:120])
+    C.rejected("classify_refuses_version_comment", err, REJECT_READONLY)
+    _, err = C.tool(sid, "query", {"sql": "SELECT * FROM /*!999999 'x */ mcpalt.t1 /*!999999 ' */"})
+    C.rejected("classify_refuses_newer_version_comment", err, REJECT_READONLY)
 
     # Whitespace and newlines before the verb must not change classification.
     rows = C.query_rows(sid, "\n\n   SELECT id FROM mcpsec.t1 WHERE id=2")
@@ -180,6 +177,11 @@ def schema_scope():
     rows = C.query_rows(sid, "SELECT 'mcpalt.t1' AS s")
     C.ok("schema_ignores_string_literal", rows == [{"s": "mcpalt.t1"}], rows)
 
+    # A table after a comma is in table position too, so an alias named after
+    # another schema does not hide that schema's qualifier.
+    _, err = C.tool(sid, "query", {"sql": "SELECT tag FROM t1 mcpalt, mcpalt.t1"})
+    C.rejected("schema_rejects_comma_join_alias", err, "outside the exposed schema")
+
     # MySQL accepts whitespace and comments around the qualifying dot, so
     # `mcpalt . t1` is the same reference as `mcpalt.t1` and must be refused
     # the same way. qualified_refs() skips the gap before testing for the dot.
@@ -191,6 +193,18 @@ def schema_scope():
             ("comment", "SELECT tag FROM mcpalt/* gap */.t1")]:
         _, err = C.tool(sid, "query", {"sql": sql})
         C.rejected("schema_reject_whitespace_dot_" + name, err, "outside the exposed schema")
+
+    # An unquoted name can start with a digit, `$` (written \x24 so mysqltest
+    # does not read a variable), or a non-ASCII letter, so each of these names
+    # a schema other than mcpsec. A number is not a qualifier.
+    for name, sql in [
+            ("digit", "SELECT tag FROM 2mcpsec.t1"),
+            ("dollar", "SELECT tag FROM \x24mcpsec.t1"),
+            ("non_ascii", "SELECT tag FROM émcpsec.t1")]:
+        _, err = C.tool(sid, "query", {"sql": sql})
+        C.rejected("schema_reject_prefix_" + name, err, "outside the exposed schema")
+    rows = C.query_rows(sid, "SELECT 1.5 AS n")
+    C.ok("schema_allows_decimal_literal", bool(rows), rows)
 
     # Scoping reads the submitted statement, so a view inside the exposed schema
     # reaches through to whatever it was defined over. That is how SQL intends a
@@ -237,10 +251,11 @@ def schema_scope():
             ("databases", "SHOW DATABASES"),
             ("procedure_status", "SHOW PROCEDURE STATUS"),
             ("open_tables", "SHOW OPEN TABLES"),
-            ("exec_comment", "SHOW TABLES /*!FROM mcpalt*/"),
-            ("exec_comment_version", "SHOW /*!40000 DATABASES */")]:
+            ("exec_comment", "SHOW TABLES /*!FROM mcpalt*/")]:
         _, err = C.tool(sid, "query", {"sql": sql})
         C.rejected("schema_reject_show_" + name, err, "can read outside the exposed schema")
+    _, err = C.tool(sid, "query", {"sql": "SHOW /*!40000 DATABASES */"})
+    C.rejected("schema_reject_show_exec_comment_version", err, REJECT_READONLY)
     rows = C.query_rows(sid, "SHOW CREATE TABLE mcpsec.t1")
     C.ok("schema_allows_qualified_show_create", bool(rows), rows)
 
@@ -631,9 +646,58 @@ def write_on():
          obj is not None and obj.get("affected_rows", 0) > 0, obj or err)
 
 
+def bound_arguments():
+    """Tool arguments reach the server as bound values, never as SQL text, so
+    a quote in an argument cannot end a literal."""
+    sid = C.init()
+    injected = "x\\' OR 1=1 -- "
+    _, err = C.tool(sid, "describe_table", {"schema": injected, "table": "t1"})
+    C.rejected("describe_table_binds_schema", err, "table not found")
+    _, err = C.tool(sid, "list_tables", {"schema": injected})
+    C.rejected("list_tables_binds_schema", err, "no such schema")
+
+
+def hidden_statements():
+    """One call runs one statement. A second statement hidden behind a quote in
+    a comment is refused, and MTR checks afterwards that neither statement
+    changed the table."""
+    sid = C.init()
+    hidden = " -- '\n; DELETE FROM mcpsec.t1; -- '"
+    _, err = C.tool(sid, "write", {"sql": "INSERT INTO mcpsec.t1 VALUES (11,'x')" + hidden})
+    C.ok("write_hidden_statement_refused", bool(err), err)
+    _, err = C.tool(sid, "explain", {"sql": "SELECT 1" + hidden})
+    C.ok("explain_hidden_statement_refused", bool(err), err)
+
+
+def grants_limit():
+    """The db_url account here can read only mcpsec, and vsql_mcp.schema is not
+    set, so no text check stands in the way: the server refuses mcpalt on the
+    account's grants."""
+    sid = C.init()
+    _, err = C.tool(sid, "query", {"sql": "SELECT tag FROM mcpalt.t1"})
+    C.ok("grants_refuse_other_schema", "1142" in (err or ""), err)
+
+
+def account_refused():
+    """The db_url account holds a privilege on every database, which leaves
+    the grants no limit to set, so no tool runs SQL."""
+    sid = C.init()
+    _, err = C.tool(sid, "query", {"sql": "SELECT 1 AS a"})
+    C.rejected("account_with_global_privileges_refused", err, "on every database")
+
+
+def account_reads_everything():
+    """An account that can read every database is allowed while neither schema
+    nor allowed_tables is set."""
+    sid = C.init()
+    rows = C.query_rows(sid, "SELECT 1 AS a")
+    C.ok("account_with_global_select_allowed_unconfined", rows == [{"a": 1}], rows)
+
+
 def secrets():
     """db_url embeds a password and bearer_token is a credential. Neither may
-    appear in any response, including the failure paths that mention the DSN."""
+    appear in an error or a failure path that mentions the DSN. A query that
+    reads the variables does return them; the README says so."""
     sid = C.init(token=TOKEN)
     blobs = []
 
@@ -662,7 +726,9 @@ def secrets():
  "session_expiry": session_expiry,
  "origin": origin,
  "sessions": sessions, "write_off": write_off, "write_on": write_on,
- "secrets": secrets}[MODE]()
+ "secrets": secrets, "bound_arguments": bound_arguments,
+ "hidden_statements": hidden_statements, "grants_limit": grants_limit,
+ "account_refused": account_refused, "account_reads_everything": account_reads_everything}[MODE]()
 EOF
 
 --echo # --- statement classification: evasion attempts ---
@@ -675,6 +741,54 @@ SELECT COUNT(*) AS evil_tables FROM information_schema.TABLES
 
 --echo # --- layered read-only enforcement ---
 --exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port layers
+
+--echo # --- tool arguments are bound values ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port bound_arguments
+
+--echo # --- one call runs one statement ---
+SET GLOBAL vsql_mcp.allow_write = ON;
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port hidden_statements
+SET GLOBAL vsql_mcp.allow_write = OFF;
+--echo # the hidden DELETE did not run
+SELECT COUNT(*) AS t1_rows FROM mcpsec.t1;
+
+--echo # --- the db_url account's grants are the limit ---
+CREATE USER mcplimited@'127.0.0.1';
+GRANT SELECT ON mcpsec.* TO mcplimited@'127.0.0.1';
+--disable_query_log
+--eval SET GLOBAL vsql_mcp.db_url = CONCAT('mysql://mcplimited@127.0.0.1:', @@port)
+--enable_query_log
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port grants_limit
+--disable_query_log
+--eval SET GLOBAL vsql_mcp.db_url = CONCAT('mysql://mcpuser@127.0.0.1:', @@port)
+--enable_query_log
+DROP USER mcplimited@'127.0.0.1';
+
+--echo # --- the db_url account may not hold privileges on every database ---
+CREATE USER mcpwide@'127.0.0.1';
+GRANT SELECT ON *.* TO mcpwide@'127.0.0.1';
+--disable_query_log
+--eval SET GLOBAL vsql_mcp.db_url = CONCAT('mysql://root@127.0.0.1:', @@port)
+--enable_query_log
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port account_refused
+--disable_query_log
+--eval SET GLOBAL vsql_mcp.db_url = CONCAT('mysql://mcpwide@127.0.0.1:', @@port)
+--enable_query_log
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port account_reads_everything
+SET GLOBAL vsql_mcp.schema = 'mcpsec';
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port account_refused
+CREATE USER mcpwild@'127.0.0.1';
+GRANT SELECT ON `%`.* TO mcpwild@'127.0.0.1';
+--disable_query_log
+--eval SET GLOBAL vsql_mcp.db_url = CONCAT('mysql://mcpwild@127.0.0.1:', @@port)
+--enable_query_log
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_sec.py $MYSQLTEST_VARDIR/tmp $mcp_port account_refused
+SET GLOBAL vsql_mcp.schema = '';
+--disable_query_log
+--eval SET GLOBAL vsql_mcp.db_url = CONCAT('mysql://mcpuser@127.0.0.1:', @@port)
+--enable_query_log
+DROP USER mcpwide@'127.0.0.1';
+DROP USER mcpwild@'127.0.0.1';
 
 --echo # --- schema scoping ---
 SET GLOBAL vsql_mcp.schema = 'mcpsec';

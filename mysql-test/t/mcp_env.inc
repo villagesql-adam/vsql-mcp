@@ -12,9 +12,11 @@
 #   mcpsec.v_secret  a view inside the exposed schema over a non-allowlisted table
 #   mcpalt.t1        same bare table name as mcpsec.t1, in a different schema
 #
-# The loopback account gets broad SELECT (and SHOW VIEW, so EXPLAIN can see
-# through a view) precisely so that the guardrails, not privilege errors, are
-# what reject an out-of-scope statement. Writes are granted only on mcpsec.
+# The loopback account can read both schemas (with SHOW VIEW, so EXPLAIN can
+# see through a view), so that the guardrails, not privilege errors, are what
+# reject a statement that reaches mcpalt. It holds nothing on every database,
+# which vsql_mcp refuses while schema or allowed_tables is set. Writes are
+# granted only on mcpsec.
 #
 # Leaves $mcp_port set to the actually-bound listener port. The listener binds
 # port 0 so the suite is safe under --parallel; never hardcode a port.
@@ -22,7 +24,8 @@
 INSTALL EXTENSION vsql_mcp;
 
 CREATE USER mcpuser@'127.0.0.1';
-GRANT SELECT, SHOW VIEW ON *.* TO mcpuser@'127.0.0.1';
+GRANT SELECT, SHOW VIEW ON mcpsec.* TO mcpuser@'127.0.0.1';
+GRANT SELECT, SHOW VIEW ON mcpalt.* TO mcpuser@'127.0.0.1';
 
 CREATE SCHEMA mcpsec;
 GRANT INSERT, UPDATE, DELETE ON mcpsec.* TO mcpuser@'127.0.0.1';

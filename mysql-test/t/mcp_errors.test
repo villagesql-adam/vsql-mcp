@@ -242,7 +242,10 @@ UPDATE mcpsec.t1 SET name = CONCAT('row', id);
 --echo # --- empty states ---
 CREATE TABLE mcpsec.empty_t (id INT, note VARCHAR(20));
 CREATE SCHEMA mcpempty;
+# The listing tools show only the schemas the db_url account has grants on.
+GRANT SELECT ON mcpempty.* TO mcpuser@'127.0.0.1';
 --exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_err.py $MYSQLTEST_VARDIR/tmp $mcp_port empty
+REVOKE SELECT ON mcpempty.* FROM mcpuser@'127.0.0.1';
 DROP SCHEMA mcpempty;
 DROP TABLE mcpsec.empty_t;
 

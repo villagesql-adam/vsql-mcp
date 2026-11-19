@@ -1,23 +1,13 @@
-//! SQL execution seam.
+//! SQL execution over the `vsql_mcp.db_url` connection.
 //!
-//! Two paths run tool queries, chosen per call by [`Hybrid`]:
-//!
-//! - Native, in-process, via `vsql::preview::sql_query` (see [`native`]): used
-//!   only for `read_params`, the fixed-shape internal introspection queries
-//!   whose select-list column order the caller already knows and gives back
-//!   as `columns` — `sql_query` never has to name a column for us.
-//! - Loopback, over `vsql_mcp.db_url` (see [`Loopback`]): used for everything
-//!   else — `read` (the `query` tool's arbitrary SQL), `read_text` (EXPLAIN,
-//!   but also `SHOW CREATE TABLE` for the `vsql://<schema>/<table>` resource,
-//!   which needs the server's real `Create Table` column name), and `write`.
-//!   `sql_query` cannot host any of these: it reports no column names or
-//!   types at all (a server-side gap; the command-service callback that has
-//!   this metadata discards it — see `villagesql/services/preview/sql_query.cc`),
-//!   so it can't reproduce typed or name-keyed output; and a session is only
-//!   reachable from the worker thread that opened it, so the KILL-based write
-//!   timeout below (the only way to bound a write — `MAX_EXECUTION_TIME` does
-//!   not apply to INSERT/UPDATE/DELETE) cannot be sent from a second
-//!   connection while that thread is busy running the statement.
+//! Every tool statement goes over a `db_url` connection as a prepared
+//! statement. So the `db_url` account's grants apply to all of it, and one call
+//! runs exactly one statement: the server parses a prepared statement as a
+//! single statement, and text after a `;` is a syntax error. The text protocol
+//! would run every statement it is given, because the driver always asks for
+//! multi-statement support. Only fixed text uses the text protocol: the
+//! session setup, `SELECT CURRENT_USER()`, `SELECT CONNECTION_ID()`, and
+//! `KILL QUERY <id>`.
 
 use std::fmt::Write as _;
 use std::io::ErrorKind;
@@ -28,90 +18,20 @@ use mysql::prelude::{Protocol, Queryable};
 use mysql::{Column, Conn, Opts, OptsBuilder, Value as MyValue};
 use serde_json::{Map, Value as Json};
 
+use crate::config::RequestConfig;
+use crate::guardrails;
+
 pub struct Rows {
     pub columns: Vec<String>,
     pub rows: Vec<Json>,
     pub truncated: bool,
 }
 
-/// One expected column of a `read_params` call, in select-list order. `numeric`
-/// tells the native path (see module docs) to parse the cell and emit a JSON
-/// number instead of a string, so a column that was a typed integer over the
-/// loopback path — `TABLE_ROWS`, say — renders the same way over either path.
-/// The loopback path ignores this: the driver already reports the real type.
-#[derive(Clone, Copy)]
-pub struct ColumnHint {
-    pub name: &'static str,
-    pub numeric: bool,
-}
-
-/// A text/enum column: rendered as a JSON string (or null), same as the
-/// loopback path already renders it.
-pub const fn col(name: &'static str) -> ColumnHint {
-    ColumnHint { name, numeric: false }
-}
-
-/// An integer column: rendered as a JSON number (or null) over the native
-/// path, matching what the loopback path's typed driver value already gives.
-pub const fn numeric_col(name: &'static str) -> ColumnHint {
-    ColumnHint { name, numeric: true }
-}
-
-pub trait QueryExecutor {
-    /// Run a read-only statement, returning at most `max_rows` rows as JSON
-    /// objects. Sets a read-only session and a statement timeout. Uses the
-    /// binary protocol so numeric columns arrive typed, not as strings.
-    fn read(&self, sql: &str, max_rows: usize, timeout_s: u64) -> Result<Rows, String>;
-
-    /// Run a read-only statement whose single string cell we want (EXPLAIN,
-    /// SHOW CREATE) — statements the binary/prepared protocol may reject, and
-    /// (for SHOW CREATE) whose real column name (`Create Table`) the caller
-    /// needs. Uses the text protocol, so callers must expect string cells.
-    fn read_text(&self, sql: &str, max_rows: usize, timeout_s: u64) -> Result<Rows, String>;
-
-    /// Run a write statement, returning the affected-row count.
-    fn write(&self, sql: &str, timeout_s: u64) -> Result<u64, String>;
-
-    /// Run exactly one statement the way `write` does, returning the
-    /// affected-row count. It goes through the prepared-statement protocol,
-    /// which the server parses as a single statement, so text after a `;`
-    /// is a syntax error rather than a second statement. The text protocol
-    /// `write` uses runs every statement it is given: the driver always asks
-    /// for multi-statement support.
-    fn write_one(&self, sql: &str, timeout_s: u64) -> Result<u64, String>;
-
-    /// Run one `SELECT` of a function call with positional parameters and
-    /// return its first row. With `read_only`, the session is the read-only,
-    /// time-limited one `read` uses; without it, the session can write and is
-    /// bounded the way `write` is. Always over the `db_url` connection, so the
-    /// function runs as that account.
-    fn call_function(
-        &self,
-        sql: &str,
-        params: Vec<MyValue>,
-        read_only: bool,
-        timeout_s: u64,
-    ) -> Result<Rows, String>;
-
-    /// Run a read-only statement with positional parameters, returning all
-    /// rows keyed by `columns` — which the caller must give in the exact
-    /// order its `sql`'s select list names them, since the native path (see
-    /// module docs) cannot report the server's own names back.
-    fn read_params(
-        &self,
-        sql: &str,
-        params: Vec<MyValue>,
-        columns: &[ColumnHint],
-        timeout_s: u64,
-    ) -> Result<Rows, String>;
-}
-
 /// List every schema name the account can see.
-pub fn schema_names(exec: &dyn QueryExecutor, timeout_s: u64) -> Result<Vec<String>, String> {
+pub fn schema_names(exec: &Loopback, timeout_s: u64) -> Result<Vec<String>, String> {
     let rows = exec.read_params(
         "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME",
         vec![],
-        &[col("SCHEMA_NAME")],
         timeout_s,
     )?;
     Ok(rows
@@ -121,47 +41,121 @@ pub fn schema_names(exec: &dyn QueryExecutor, timeout_s: u64) -> Result<Vec<Stri
         .collect())
 }
 
-/// Whether a schema exists at all. Used to tell "this schema has no tables"
-/// apart from "there is no such schema", which otherwise read identically.
-pub fn schema_exists(exec: &dyn QueryExecutor, schema: &str, timeout_s: u64) -> Result<bool, String> {
+/// The tables and views in one schema that the allowlist lets an agent see,
+/// with row estimates. A listing narrows rather than fails: an excluded table
+/// is not offered, so an agent never learns it exists. A schema with no tables
+/// and a schema that does not exist are different answers, so a mistyped name
+/// is corrected rather than read as empty.
+pub fn visible_tables(exec: &Loopback, schema: &str, cfg: &RequestConfig) -> Result<Vec<Json>, String> {
     let rows = exec.read_params(
-        "SELECT 1 AS present FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?",
-        vec![MyValue::from(schema.to_owned())],
-        &[numeric_col("present")],
-        timeout_s,
-    )?;
-    Ok(!rows.rows.is_empty())
-}
-
-/// List the tables and views in one schema, with row estimates.
-pub fn tables_in_schema(
-    exec: &dyn QueryExecutor,
-    schema: &str,
-    timeout_s: u64,
-) -> Result<Rows, String> {
-    exec.read_params(
         "SELECT TABLE_NAME, TABLE_TYPE, TABLE_ROWS FROM information_schema.TABLES \
          WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
         vec![MyValue::from(schema.to_owned())],
-        &[col("TABLE_NAME"), col("TABLE_TYPE"), numeric_col("TABLE_ROWS")],
-        timeout_s,
-    )
+        cfg.query_timeout,
+    )?;
+    if rows.rows.is_empty() {
+        let found = exec.read_params(
+            "SELECT 1 AS present FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?",
+            vec![MyValue::from(schema.to_owned())],
+            cfg.query_timeout,
+        )?;
+        if found.rows.is_empty() {
+            return Err(format!("no such schema: {schema}"));
+        }
+    }
+    Ok(rows
+        .rows
+        .into_iter()
+        .filter(|r| {
+            r.get("TABLE_NAME")
+                .and_then(Json::as_str)
+                .is_some_and(|t| guardrails::table_allowed(t, &cfg.allowed_tables))
+        })
+        .collect())
 }
 
-/// Loopback executor: opens a fresh connection per call. Connection-per-call
+/// Opens a fresh connection per call. Connection-per-call
 /// keeps every tool invocation independent and re-entrant; the worker handles
 /// requests serially, so there is no connection contention to pool around.
 pub struct Loopback<'a> {
     url: &'a str,
     schema: &'a str,
+    /// `vsql_mcp.schema` or `vsql_mcp.allowed_tables` is set, so the account
+    /// may not hold even a read privilege on every database.
+    confined: bool,
 }
 
 impl<'a> Loopback<'a> {
-    pub fn new(url: &'a str, schema: &'a str) -> Self {
-        Self { url, schema }
+    pub fn new(url: &'a str, schema: &'a str, allowlist_set: bool) -> Self {
+        Self {
+            url,
+            schema,
+            confined: !schema.is_empty() || allowlist_set,
+        }
     }
 
     fn connect(&self, timeout_s: u64) -> Result<Conn, String> {
+        let mut conn = self.open(timeout_s)?;
+        self.check_account(&mut conn)?;
+        Ok(conn)
+    }
+
+    /// Refuse an account that holds a privilege on every database, such as
+    /// root. The account's grants are what limit an agent, so an account that
+    /// can reach everything leaves no limit at all. Reading every database is
+    /// allowed only while neither `schema` nor `allowed_tables` is set. This
+    /// reads the account's own grants, not those of a role.
+    fn check_account(&self, conn: &mut Conn) -> Result<(), String> {
+        let user: String = conn
+            .query_first("SELECT CURRENT_USER()")
+            .map_err(map_err)?
+            .unwrap_or_default();
+        let (name, host) = user.rsplit_once('@').unwrap_or((&user, ""));
+        let grantee = format!("'{name}'@'{host}'");
+        let privileges: Vec<String> = conn
+            .exec(
+                "SELECT PRIVILEGE_TYPE FROM information_schema.USER_PRIVILEGES WHERE GRANTEE = ?",
+                (&grantee,),
+            )
+            .map_err(map_err)?;
+        // A grant on a database pattern such as `%` reaches every database
+        // whose name matches, so it counts as a grant on every database.
+        let patterns: Vec<String> = conn
+            .exec(
+                "SELECT DISTINCT TABLE_SCHEMA FROM information_schema.SCHEMA_PRIVILEGES \
+                 WHERE GRANTEE = ?",
+                (&grantee,),
+            )
+            .map_err(map_err)?;
+        let allowed: &[&str] = if self.confined {
+            &["USAGE"]
+        } else {
+            &["USAGE", "SELECT", "SHOW VIEW"]
+        };
+        let extra: Vec<String> = privileges
+            .into_iter()
+            .filter(|p| !allowed.contains(&p.as_str()))
+            .chain(
+                patterns
+                    .into_iter()
+                    .filter(|db| db.contains('%'))
+                    .map(|db| format!("a grant on `{db}`.*")),
+            )
+            .collect();
+        if extra.is_empty() {
+            return Ok(());
+        }
+        let mut held = extra.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+        if extra.len() > 5 {
+            let _ = write!(held, " and {} more", extra.len() - 5);
+        }
+        Err(format!(
+            "the vsql_mcp.db_url account {user} holds {held} on every database; grant \
+             it privileges on the exposed schema or tables only"
+        ))
+    }
+
+    fn open(&self, timeout_s: u64) -> Result<Conn, String> {
         if self.url.trim().is_empty() {
             return Err("vsql_mcp.db_url is not set".to_owned());
         }
@@ -170,17 +164,24 @@ impl<'a> Loopback<'a> {
             .read_timeout(Some(Duration::from_secs(timeout_s)))
             .write_timeout(Some(Duration::from_secs(timeout_s)));
         if self.schema.is_empty() {
-            return Conn::new(opts).map_err(|e| format!("loopback connect failed: {e}"));
+            return Conn::new(opts).map_err(|e| format!("loopback connect failed: {}", describe(e)));
         }
         // The exposed schema is the session's default database, so a bare table
         // name resolves inside it. It replaces any database named in `db_url`:
         // `guardrails::schema_violation` checks only qualified names, and a
         // default pointing elsewhere would send bare names past it.
+        // The server reports a database the account has no grant on as access
+        // denied, so it cannot tell that case from a missing database either.
         Conn::new(opts.db_name(Some(self.schema))).map_err(|e| match &e {
-            mysql::Error::MySqlError(db) if db.code == ER_BAD_DB_ERROR => {
-                format!("vsql_mcp.schema '{}' does not exist", self.schema)
+            mysql::Error::MySqlError(db)
+                if db.code == ER_BAD_DB_ERROR || db.code == ER_DBACCESS_DENIED_ERROR =>
+            {
+                format!(
+                    "vsql_mcp.schema '{}' does not exist, or the db_url account has no grant on it",
+                    self.schema
+                )
             }
-            _ => format!("loopback connect failed: {e}"),
+            _ => format!("loopback connect failed: {}", describe(e)),
         })
     }
 
@@ -255,23 +256,29 @@ impl Loopback<'_> {
         }
     }
 
-    /// The body of `write` and `write_one`, which differ only in `prepared`.
-    fn bounded_write(&self, sql: &str, timeout_s: u64, prepared: bool) -> Result<u64, String> {
-        // MAX_EXECUTION_TIME does not apply to INSERT/UPDATE/DELETE, so the
-        // only way to bound a write is to kill it. Give the client read timeout
-        // headroom so the kill is what ends the statement, and the caller gets
-        // a definite answer instead of a dropped socket.
+    /// Run `work` on a session that can write, killing it if it outlives
+    /// `timeout_s`. MAX_EXECUTION_TIME does not apply to INSERT/UPDATE/DELETE,
+    /// so the only way to bound a write is to kill it. The client read timeout
+    /// gets headroom so the kill is what ends the statement, and the caller
+    /// gets a definite answer instead of a dropped socket.
+    fn bounded<T>(
+        &self,
+        timeout_s: u64,
+        work: impl FnOnce(&mut Conn) -> Result<T, mysql::Error>,
+    ) -> Result<T, String> {
         let mut conn = self.connect(timeout_s.saturating_add(READ_TIMEOUT_HEADROOM_S))?;
         let watchdog = self.spawn_kill_watchdog(&mut conn, timeout_s);
-        let outcome = if prepared {
-            conn.exec_drop(sql, ())
-        } else {
-            conn.query_drop(sql)
-        }
-        .map_err(map_write_err);
+        let outcome = work(&mut conn).map_err(map_write_err);
         drop(watchdog);
-        outcome?;
-        Ok(conn.affected_rows())
+        outcome
+    }
+
+    /// Run a write statement, returning the affected-row count.
+    pub fn write(&self, sql: &str, timeout_s: u64) -> Result<u64, String> {
+        self.bounded(timeout_s, |conn| {
+            conn.exec_drop(sql, ())?;
+            Ok(conn.affected_rows())
+        })
     }
 }
 
@@ -279,28 +286,28 @@ impl Loopback<'_> {
 /// send one statement, and a slow kill helps nobody.
 const KILL_TIMEOUT_S: u64 = 10;
 
-impl QueryExecutor for Loopback<'_> {
-    fn read(&self, sql: &str, max_rows: usize, timeout_s: u64) -> Result<Rows, String> {
+impl Loopback<'_> {
+    /// Run a read-only statement, returning at most `max_rows` rows as JSON
+    /// objects. Sets a read-only session, a statement timeout, and a row cap.
+    pub fn read(&self, sql: &str, max_rows: usize, timeout_s: u64) -> Result<Rows, String> {
         let mut conn = self.read_conn(timeout_s, Some(max_rows))?;
         let result = conn.exec_iter(sql, ()).map_err(map_err)?;
         collect(result, max_rows).map_err(map_err)
     }
 
-    fn read_text(&self, sql: &str, max_rows: usize, timeout_s: u64) -> Result<Rows, String> {
+    /// Run a read-only statement with positional parameters, returning all of
+    /// its rows.
+    pub fn read_params(&self, sql: &str, params: Vec<MyValue>, timeout_s: u64) -> Result<Rows, String> {
         let mut conn = self.read_conn(timeout_s, None)?;
-        let result = conn.query_iter(sql).map_err(map_err)?;
-        collect(result, max_rows).map_err(map_err)
+        let result = conn.exec_iter(sql, params).map_err(map_err)?;
+        collect(result, usize::MAX).map_err(map_err)
     }
 
-    fn write(&self, sql: &str, timeout_s: u64) -> Result<u64, String> {
-        self.bounded_write(sql, timeout_s, false)
-    }
-
-    fn write_one(&self, sql: &str, timeout_s: u64) -> Result<u64, String> {
-        self.bounded_write(sql, timeout_s, true)
-    }
-
-    fn call_function(
+    /// Run one `SELECT` of a function call with positional parameters and
+    /// return its first row. With `read_only`, the session is the read-only,
+    /// time-limited one `read` uses; without it, the session can write and is
+    /// bounded the way `write` is.
+    pub fn call_function(
         &self,
         sql: &str,
         params: Vec<MyValue>,
@@ -312,31 +319,11 @@ impl QueryExecutor for Loopback<'_> {
             let result = conn.exec_iter(sql, params).map_err(map_err)?;
             return collect(result, 1).map_err(map_err);
         }
-        // A writing function gets the write tool's session: not read-only, and
-        // stopped by the KILL watchdog rather than MAX_EXECUTION_TIME.
-        let mut conn = self.connect(timeout_s.saturating_add(READ_TIMEOUT_HEADROOM_S))?;
-        let watchdog = self.spawn_kill_watchdog(&mut conn, timeout_s);
-        let outcome = conn
-            .exec_iter(sql, params)
-            .and_then(|result| collect(result, 1))
-            .map_err(map_write_err);
-        drop(watchdog);
-        outcome
-    }
-
-    fn read_params(
-        &self,
-        sql: &str,
-        params: Vec<MyValue>,
-        _columns: &[ColumnHint],
-        timeout_s: u64,
-    ) -> Result<Rows, String> {
-        // The driver reports the server's real column names for every row, so
-        // the caller-given `columns` (needed by the native path; see module
-        // docs) is redundant here and ignored.
-        let mut conn = self.read_conn(timeout_s, None)?;
-        let result = conn.exec_iter(sql, params).map_err(map_err)?;
-        collect(result, usize::MAX).map_err(map_err)
+        // A writing function gets the write tool's session.
+        self.bounded(timeout_s, |conn| {
+            let result = conn.exec_iter(sql, params)?;
+            collect(result, 1)
+        })
     }
 }
 
@@ -370,7 +357,7 @@ fn io_kind_of(e: &mysql::Error) -> Option<ErrorKind> {
 /// server-side `MAX_EXECUTION_TIME` (error 3024) or the client read timeout.
 fn is_timeout(e: &mysql::Error) -> bool {
     if let mysql::Error::MySqlError(db) = e {
-        if db.code == 3024 {
+        if db.code == ER_QUERY_TIMEOUT {
             return true;
         }
     }
@@ -426,11 +413,18 @@ fn map_write_err(e: mysql::Error) -> String {
     describe(e)
 }
 
+/// `ER_QUERY_TIMEOUT` — what a statement stopped by `MAX_EXECUTION_TIME` reports.
+const ER_QUERY_TIMEOUT: u16 = 3024;
+
 /// `ER_QUERY_INTERRUPTED` — what a killed statement reports.
 const ER_QUERY_INTERRUPTED: u16 = 1317;
 
 /// `ER_BAD_DB_ERROR` — what a connect to a missing default database reports.
 const ER_BAD_DB_ERROR: u16 = 1049;
+
+/// `ER_DBACCESS_DENIED_ERROR` — what a connect to a default database that the
+/// account has no grant on reports.
+const ER_DBACCESS_DENIED_ERROR: u16 = 1044;
 
 /// Drain a query result into JSON, capping at `max_rows`. When more rows exist
 /// than the cap, `truncated` is set and the surplus is consumed and discarded.
@@ -546,187 +540,4 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
-}
-
-/// The in-process execution path, backed by an open `vsql::preview::sql_query`
-/// session. See the module docs for what this can and cannot host.
-mod native {
-    use serde_json::{Map, Value as Json};
-    use villagesql::preview::sql_query::{Diag, Session};
-
-    use super::{ColumnHint, Rows};
-
-    /// `MAX_EXECUTION_TIME` interrupting a statement — the same numeric error
-    /// the loopback path already matches on, for the same reason (see
-    /// `map_err` above).
-    const ER_QUERY_INTERRUPTED: u32 = 3024;
-
-    fn describe(diag: &Diag) -> String {
-        format!("ERROR {} ({}): {}", diag.errno, diag.sqlstate, diag.message)
-    }
-
-    fn map_err(diag: Diag) -> String {
-        if diag.errno == ER_QUERY_INTERRUPTED {
-            return "statement exceeded vsql_mcp.query_timeout".to_owned();
-        }
-        describe(&diag)
-    }
-
-    /// Run one setup statement (session mode, timeout) that must succeed
-    /// before the real query runs.
-    fn run_admin(session: &Session, sql: &str) -> Result<(), String> {
-        let result = session
-            .execute(sql)
-            .ok_or_else(|| "sql_query: could not open a session-setup statement".to_owned())?;
-        match result.error() {
-            Some(diag) => Err(describe(&diag)),
-            None => Ok(()),
-        }
-    }
-
-    /// Put the session into the same read-only, timeout-bounded state the
-    /// loopback path sets up per connection (see `Loopback::read_conn`).
-    fn set_read_only(session: &Session, timeout_s: u64) -> Result<(), String> {
-        run_admin(session, "SET SESSION TRANSACTION READ ONLY")?;
-        run_admin(
-            session,
-            &format!("SET SESSION MAX_EXECUTION_TIME = {}", timeout_s.saturating_mul(1000)),
-        )
-    }
-
-    /// Substitute each `?` in `sql` with `params[i]` rendered as an escaped SQL
-    /// literal. `sql_query` takes only raw text (villagesql-server#627 tracks
-    /// giving it real bind values); this is the one place in the extension
-    /// that has to do the escaping by hand, and it does so with the same
-    /// driver (`mysql::Value::as_sql`) the loopback path already trusts to
-    /// quote a literal correctly.
-    fn bind(sql: &str, params: &[super::MyValue]) -> Result<String, String> {
-        let mut parts = sql.split('?');
-        let mut out = parts
-            .next()
-            .ok_or_else(|| "empty statement".to_owned())?
-            .to_owned();
-        for (part, param) in parts.zip(params) {
-            out.push_str(&param.as_sql(true));
-            out.push_str(part);
-        }
-        // One fewer `?` than params, or vice versa, means the caller's
-        // placeholder count doesn't match — a bug in this extension's own
-        // code, not something a live server round trip would ever surface.
-        if sql.matches('?').count() != params.len() {
-            return Err(format!(
-                "sql_query: {} placeholder(s) in statement but {} parameter(s) given",
-                sql.matches('?').count(),
-                params.len()
-            ));
-        }
-        Ok(out)
-    }
-
-    /// Run a statement with positional parameters, keying every row with
-    /// `columns` in position order (see `QueryExecutor::read_params`).
-    pub fn read_params(
-        session: &Session,
-        sql: &str,
-        params: Vec<super::MyValue>,
-        columns: &[ColumnHint],
-        timeout_s: u64,
-    ) -> Result<Rows, String> {
-        let bound = bind(sql, &params)?;
-        set_read_only(session, timeout_s)?;
-        let mut result = session
-            .execute(&bound)
-            .ok_or_else(|| "sql_query: could not open the statement".to_owned())?;
-        if let Some(diag) = result.error() {
-            return Err(map_err(diag));
-        }
-        let mut rows = Vec::new();
-        while let Some(row) = result.next_row() {
-            let mut obj = Map::with_capacity(columns.len());
-            for (i, hint) in columns.iter().enumerate() {
-                let cell = row.get_str(i as u32);
-                let value = match (cell, hint.numeric) {
-                    (None, _) => Json::Null,
-                    (Some(s), true) => s
-                        .trim()
-                        .parse::<i64>()
-                        .map_or(Json::Null, Json::from),
-                    (Some(s), false) => Json::String(s.to_owned()),
-                };
-                obj.insert(hint.name.to_owned(), value);
-            }
-            rows.push(Json::Object(obj));
-        }
-        Ok(Rows {
-            columns: columns.iter().map(|h| h.name.to_owned()).collect(),
-            rows,
-            truncated: false,
-        })
-    }
-}
-
-/// Routes each `QueryExecutor` method to whichever path can host it — see the
-/// module docs. `native` is `None` when the capability is unavailable (preview
-/// extensions off, or an SDK build predating `sql_query`), in which case every
-/// method falls back to the loopback connection exactly as before.
-pub struct Hybrid<'a> {
-    loopback: Loopback<'a>,
-    // `SQL_QUERY` is a `static`, so every `Session` it opens is `Session<'static>`
-    // regardless of how long the borrow held here lasts.
-    native: Option<&'a villagesql::preview::sql_query::Session<'static>>,
-}
-
-impl<'a> Hybrid<'a> {
-    pub fn new(
-        db_url: &'a str,
-        schema: &'a str,
-        native: Option<&'a villagesql::preview::sql_query::Session<'static>>,
-    ) -> Self {
-        Self {
-            loopback: Loopback::new(db_url, schema),
-            native,
-        }
-    }
-}
-
-impl QueryExecutor for Hybrid<'_> {
-    fn read(&self, sql: &str, max_rows: usize, timeout_s: u64) -> Result<Rows, String> {
-        self.loopback.read(sql, max_rows, timeout_s)
-    }
-
-    fn read_text(&self, sql: &str, max_rows: usize, timeout_s: u64) -> Result<Rows, String> {
-        self.loopback.read_text(sql, max_rows, timeout_s)
-    }
-
-    fn write(&self, sql: &str, timeout_s: u64) -> Result<u64, String> {
-        self.loopback.write(sql, timeout_s)
-    }
-
-    fn write_one(&self, sql: &str, timeout_s: u64) -> Result<u64, String> {
-        self.loopback.write_one(sql, timeout_s)
-    }
-
-    fn call_function(
-        &self,
-        sql: &str,
-        params: Vec<MyValue>,
-        read_only: bool,
-        timeout_s: u64,
-    ) -> Result<Rows, String> {
-        self.loopback
-            .call_function(sql, params, read_only, timeout_s)
-    }
-
-    fn read_params(
-        &self,
-        sql: &str,
-        params: Vec<MyValue>,
-        columns: &[ColumnHint],
-        timeout_s: u64,
-    ) -> Result<Rows, String> {
-        match self.native {
-            Some(session) => native::read_params(session, sql, params, columns, timeout_s),
-            None => self.loopback.read_params(sql, params, columns, timeout_s),
-        }
-    }
 }
