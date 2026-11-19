@@ -17,15 +17,23 @@ use crate::config::RequestConfig;
 use crate::executor::Loopback;
 use crate::{resources, status, tools};
 
-/// Protocol version this server implements and advertises.
+/// Protocol version this server advertises in an `initialize` response.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// The stateless revision. A request in it carries its protocol version and
+/// client capabilities in `params._meta`, and there is no session.
+pub const STATELESS_VERSION: &str = "2026-07-28";
 
 /// The only JSON-RPC version MCP uses. Required on every request.
 pub const JSONRPC_VERSION: &str = "2.0";
 
-/// Versions accepted in the `MCP-Protocol-Version` header. `2025-03-26` is the
-/// value the spec says to assume when the header is absent, so we accept it too.
-pub const SUPPORTED_VERSIONS: &[&str] = &[PROTOCOL_VERSION, "2025-03-26"];
+/// Every version this server speaks, newest first. `2025-03-26` is the value the
+/// spec says to assume when the header is absent, so we accept it too.
+pub const SUPPORTED_VERSIONS: &[&str] = &[STATELESS_VERSION, PROTOCOL_VERSION, "2025-03-26"];
+
+pub const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+pub const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 
 /// Upper bound on live sessions, so a client that keeps calling `initialize`
 /// without ever deleting cannot grow the map without limit before the TTL
@@ -115,6 +123,27 @@ pub fn result(id: &Json, value: Json) -> Json {
     json!({ "jsonrpc": JSONRPC_VERSION, "id": id, "result": value })
 }
 
+/// The `-32022` error a stateless client reads to pick a version and retry.
+pub fn unsupported_version(id: &Json, requested: &str) -> Json {
+    json!({
+        "jsonrpc": JSONRPC_VERSION,
+        "id": id,
+        "error": {
+            "code": -32022,
+            "message": "Unsupported protocol version",
+            "data": { "supported": SUPPORTED_VERSIONS, "requested": requested }
+        }
+    })
+}
+
+fn capabilities() -> Json {
+    json!({ "tools": {}, "resources": {} })
+}
+
+fn server_info() -> Json {
+    json!({ "name": "vsql_mcp", "version": env!("CARGO_PKG_VERSION") })
+}
+
 /// The `initialize` result: advertised protocol version, capabilities, and
 /// server identity.
 pub fn initialize_result(id: &Json) -> Json {
@@ -122,16 +151,34 @@ pub fn initialize_result(id: &Json) -> Json {
         id,
         json!({
             "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {
-                "tools": {},
-                "resources": {}
-            },
-            "serverInfo": {
-                "name": "vsql_mcp",
-                "version": env!("CARGO_PKG_VERSION")
-            }
+            "capabilities": capabilities(),
+            "serverInfo": server_info()
         }),
     )
+}
+
+/// Route a request in the stateless revision and add the result fields it
+/// requires. `ttlMs` is 0 and the scope private because every list and read
+/// reflects live database state as the `db_url` account sees it.
+pub fn dispatch_stateless(method: &str, params: &Json, id: &Json, cfg: &RequestConfig, exec: &Loopback) -> Json {
+    let mut response = match method {
+        "server/discover" => result(
+            id,
+            json!({ "supportedVersions": SUPPORTED_VERSIONS, "capabilities": capabilities() }),
+        ),
+        // This revision removed ping.
+        "ping" => error(id, -32601, &format!("method not found: {method}")),
+        _ => dispatch(method, params, id, cfg, exec),
+    };
+    if let Some(res) = response.get_mut("result").and_then(Json::as_object_mut) {
+        res.insert("resultType".into(), json!("complete"));
+        res.insert("_meta".into(), json!({ META_SERVER_INFO: server_info() }));
+        if matches!(method, "server/discover" | "tools/list" | "resources/list" | "resources/read") {
+            res.insert("ttlMs".into(), json!(0));
+            res.insert("cacheScope".into(), json!("private"));
+        }
+    }
+    response
 }
 
 /// Route a non-initialize JSON-RPC request to its handler and return a full

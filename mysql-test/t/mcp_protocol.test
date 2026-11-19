@@ -1,4 +1,4 @@
-# vsql_mcp — MCP protocol compliance (spec revision 2025-06-18, Streamable HTTP).
+# vsql_mcp — MCP protocol compliance (spec revisions 2026-07-28 and 2025-06-18, Streamable HTTP).
 #
 # Covers the shapes mcp_basic does not: initialize negotiation, structural
 # validation of every advertised inputSchema, tools/call argument handling,
@@ -70,11 +70,15 @@ def handshake():
     st, _, hdr = C.request({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
     C.ok("known_init_accepts_missing_params", st == 200 and bool(hdr.get("Mcp-Session-Id")), st)
 
-    # The MCP-Protocol-Version HEADER is validated, unlike the params field.
+    # The MCP-Protocol-Version HEADER is validated, unlike the params field. The
+    # error lists the versions the server speaks, so a client can retry with one.
     st, body, _ = C.request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
                             proto="1999-01-01")
     C.ok("init_rejects_unsupported_version_header",
-         st == 400 and is_rpc_error(body, -32600), (st, body))
+         st == 400 and is_rpc_error(body, -32022), (st, body))
+    C.ok("init_unsupported_version_lists_supported",
+         body["error"]["data"] == {"supported": ["2026-07-28", "2025-06-18", "2025-03-26"],
+                                   "requested": "1999-01-01"}, body)
     # An absent header means "assume 2025-03-26", which the server accepts.
     st, _, _ = C.request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
                          proto=None)
@@ -410,9 +414,124 @@ def transport():
          "application/json" in (hdr.get("Content-Type") or ""), hdr.get("Content-Type"))
 
 
+STATELESS = "2026-07-28"
+
+
+def sreq(method, params=None, name=None, meta=None, headers=None):
+    """One request in the stateless revision, with the headers a conforming
+    client sends. `meta` replaces the default _meta; `headers` overrides."""
+    p = dict(params or {})
+    p["_meta"] = meta if meta is not None else {
+        "io.modelcontextprotocol/protocolVersion": STATELESS,
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {"name": "mtr", "version": "1"}}
+    h = {"Mcp-Method": method}
+    if name is not None:
+        h["Mcp-Name"] = name
+    h.update(headers or {})
+    return C.request({"jsonrpc": "2.0", "id": 1, "method": method, "params": p},
+                     proto=STATELESS, headers=h)
+
+
+def stateless():
+    """Revision 2026-07-28: no initialize and no session. Every request carries
+    its version in _meta and mirrors its routing fields in headers."""
+    st, body, hdr = sreq("server/discover")
+    res = (body or {}).get("result", {})
+    C.ok("stateless_discover_200", st == 200, (st, body))
+    C.ok("stateless_discover_lists_versions",
+         res.get("supportedVersions") == ["2026-07-28", "2025-06-18", "2025-03-26"], res)
+    C.ok("stateless_discover_capabilities",
+         res.get("capabilities") == {"tools": {}, "resources": {}}, res)
+    C.ok("stateless_discover_server_info",
+         res.get("_meta", {}).get("io.modelcontextprotocol/serverInfo", {}).get("name")
+         == "vsql_mcp", res)
+    C.ok("stateless_discover_result_type", res.get("resultType") == "complete", res)
+    C.ok("stateless_discover_cache_fields",
+         res.get("ttlMs") == 0 and res.get("cacheScope") == "private", res)
+    C.ok("stateless_issues_no_session", "Mcp-Session-Id" not in hdr, hdr)
+
+    st, body, _ = sreq("tools/list")
+    res = (body or {}).get("result", {})
+    C.ok("stateless_tools_list_without_session", st == 200 and len(res.get("tools", [])) > 0,
+         (st, body))
+    st, body, _ = sreq("tools/call", {"name": "query", "arguments": {"sql": "SELECT 7 AS n"}},
+                       name="query")
+    res = (body or {}).get("result", {})
+    C.ok("stateless_tools_call_runs", st == 200 and res.get("isError") is False
+         and json.loads(res["content"][0]["text"])["rows"] == [{"n": 7}], (st, body))
+    C.ok("stateless_tools_call_result_type",
+         res.get("resultType") == "complete" and "ttlMs" not in res, res)
+
+    # A non-ASCII or otherwise unsafe Mcp-Name arrives base64-encoded; the
+    # server decodes it before comparing. "query" encodes to cXVlcnk=.
+    st, body, _ = sreq("tools/call", {"name": "query", "arguments": {"sql": "SELECT 1"}},
+                       name="=?base64?cXVlcnk=?=")
+    C.ok("stateless_mcp_name_base64_decoded", st == 200 and "result" in body, (st, body))
+
+    st, body, _ = sreq("resources/list")
+    C.ok("stateless_resources_list", st == 200 and "resources" in body["result"], (st, body))
+    st, body, _ = sreq("resources/read", {"uri": "vsql://mcpsec/t1"}, name="vsql://mcpsec/t1")
+    C.ok("stateless_resources_read", st == 200
+         and "CREATE TABLE" in body["result"]["contents"][0]["text"], (st, body))
+
+    # A session id from an older client is ignored, not checked.
+    st, body, _ = sreq("tools/list", headers={"Mcp-Session-Id": "nosuchsession"})
+    C.ok("stateless_ignores_session_header", st == 200 and "result" in body, (st, body))
+
+    # Malformed _meta is invalid params.
+    st, body, _ = sreq("tools/list", meta={"io.modelcontextprotocol/protocolVersion": STATELESS})
+    C.ok("stateless_missing_capabilities_invalid_params",
+         st == 400 and is_rpc_error(body, -32602), (st, body))
+    st, body, _ = sreq("tools/list", meta={})
+    C.ok("stateless_header_without_meta_invalid_params",
+         st == 400 and is_rpc_error(body, -32602), (st, body))
+
+    # A legacy version named in _meta is not served statelessly; the client is
+    # told which versions exist.
+    st, body, _ = sreq("tools/list", meta={
+        "io.modelcontextprotocol/protocolVersion": "2025-06-18",
+        "io.modelcontextprotocol/clientCapabilities": {}})
+    C.ok("stateless_legacy_meta_version_unsupported",
+         st == 400 and is_rpc_error(body, -32022)
+         and body["error"]["data"]["requested"] == "2025-06-18", (st, body))
+
+    # Headers that disagree with the body are refused.
+    st, body, _ = sreq("tools/list", headers={"MCP-Protocol-Version": None})
+    C.ok("stateless_missing_version_header_mismatch",
+         st == 400 and is_rpc_error(body, -32020), (st, body))
+    st, body, _ = sreq("tools/list", headers={"Mcp-Method": "resources/list"})
+    C.ok("stateless_method_header_mismatch",
+         st == 400 and is_rpc_error(body, -32020), (st, body))
+    st, body, _ = sreq("tools/list", headers={"Mcp-Method": None})
+    C.ok("stateless_missing_method_header", st == 400 and is_rpc_error(body, -32020), (st, body))
+    st, body, _ = sreq("tools/call", {"name": "query", "arguments": {"sql": "SELECT 1"}},
+                       name="write")
+    C.ok("stateless_name_header_mismatch", st == 400 and is_rpc_error(body, -32020), (st, body))
+    st, body, _ = sreq("tools/call", {"name": "query", "arguments": {"sql": "SELECT 1"}})
+    C.ok("stateless_missing_name_header", st == 400 and is_rpc_error(body, -32020), (st, body))
+    st, body, _ = sreq("tools/call", {"name": "query", "arguments": {"sql": "SELECT 1"}},
+                       name="=?base64?!!notbase64?=")
+    C.ok("stateless_bad_base64_name_mismatch",
+         st == 400 and is_rpc_error(body, -32020), (st, body))
+
+    # This revision removed ping, and answers any unknown method with 404.
+    st, body, _ = sreq("ping")
+    C.ok("stateless_ping_removed", st == 404 and is_rpc_error(body, -32601), (st, body))
+    st, body, _ = sreq("nosuch/method")
+    C.ok("stateless_unknown_method_404", st == 404 and is_rpc_error(body, -32601), (st, body))
+
+    # initialize still opens a session, whatever version header comes with it.
+    st, body, hdr = C.request({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                               "params": {"protocolVersion": PROTOCOL, "capabilities": {}}},
+                              proto=STATELESS)
+    C.ok("stateless_initialize_still_opens_session",
+         st == 200 and bool(hdr.get("Mcp-Session-Id")), (st, hdr))
+
+
 {"handshake": handshake, "schemas": tool_schemas, "args": tool_args,
  "resources": resources, "scoped": scoped_resources, "framing": framing,
- "transport": transport}[MODE]()
+ "transport": transport, "stateless": stateless}[MODE]()
 EOF
 
 --echo # --- initialize / handshake ---
@@ -441,6 +560,9 @@ SET GLOBAL vsql_mcp.schema = '';
 
 --echo # --- transport rules ---
 --exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_proto.py $MYSQLTEST_VARDIR/tmp $mcp_port transport
+
+--echo # --- stateless revision 2026-07-28 ---
+--exec python3 -B $MYSQLTEST_VARDIR/tmp/mcp_proto.py $MYSQLTEST_VARDIR/tmp $mcp_port stateless
 
 --remove_file $MYSQLTEST_VARDIR/tmp/mcp_proto.py
 --remove_file $MYSQLTEST_VARDIR/tmp/mcp_client.py

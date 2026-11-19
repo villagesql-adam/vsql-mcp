@@ -7,9 +7,10 @@ run governed queries without a sidecar process. Where `vsql-rest` turns a schema
 into a REST API for programs, `vsql-mcp` turns it into a tool surface for
 agents.
 
-It serves MCP over the **Streamable HTTP** transport (spec revision
-`2025-06-18`) on a listener owned by a background worker inside the server
-process. See [Quick start](#quick-start) to go from installing the extension to
+It serves MCP over the **Streamable HTTP** transport on a listener owned by a
+background worker inside the server process. A client can use the stateless
+spec revision `2026-07-28`, where each request stands alone, or revision
+`2025-06-18`, which opens a session with `initialize`. See [Quick start](#quick-start) to go from installing the extension to
 a connected agent.
 
 ## Requirements
@@ -191,7 +192,7 @@ All variables are `SET GLOBAL vsql_mcp.<name>`.
 | `allowed_tables` | `""` | Comma-separated table allowlist; empty means all |
 | `max_rows` | 1000 | Row cap per `query` result |
 | `query_timeout` | 30 | Per-tool-call statement timeout (seconds) |
-| `session_ttl` | 1800 | Idle MCP session lifetime (seconds) |
+| `session_ttl` | 1800 | Idle MCP session lifetime (seconds), for `2025-06-18` clients |
 | `db_url` | `""` | Loopback DSN tool queries run through |
 
 A port change takes effect when the server is next enabled — toggle
@@ -354,7 +355,7 @@ origin gets HTTP 403), as the MCP Streamable HTTP spec requires.
 |---|---|
 | `vsql_mcp.tool_calls_total` | Tool calls handled |
 | `vsql_mcp.tool_errors_total` | Tool calls that returned an error |
-| `vsql_mcp.sessions_active` | Live MCP sessions |
+| `vsql_mcp.sessions_active` | Live MCP sessions of `2025-06-18` clients |
 | `vsql_mcp.rows_returned_total` | Rows returned by the `query` tool |
 | `vsql_mcp.http_port` | Actually-bound port (0 = not listening) |
 
