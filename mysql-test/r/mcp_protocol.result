@@ -26,6 +26,7 @@ init_issues_session_id: PASS
 known_init_ignores_client_protocol_version: PASS
 known_init_accepts_missing_params: PASS
 init_rejects_unsupported_version_header: PASS
+init_unsupported_version_lists_supported: PASS
 init_allows_absent_version_header: PASS
 init_accepts_prior_version_header: PASS
 pre_initialize_refused_tools_list: PASS
@@ -140,6 +141,33 @@ transport_delete_without_session_400: PASS
 transport_delete_unknown_session_404: PASS
 transport_delete_live_session_200: PASS
 transport_response_content_type_json: PASS
+# --- stateless revision 2026-07-28 ---
+stateless_discover_200: PASS
+stateless_discover_lists_versions: PASS
+stateless_discover_capabilities: PASS
+stateless_discover_server_info: PASS
+stateless_discover_result_type: PASS
+stateless_discover_cache_fields: PASS
+stateless_issues_no_session: PASS
+stateless_tools_list_without_session: PASS
+stateless_tools_call_runs: PASS
+stateless_tools_call_result_type: PASS
+stateless_mcp_name_base64_decoded: PASS
+stateless_resources_list: PASS
+stateless_resources_read: PASS
+stateless_ignores_session_header: PASS
+stateless_missing_capabilities_invalid_params: PASS
+stateless_header_without_meta_invalid_params: PASS
+stateless_legacy_meta_version_unsupported: PASS
+stateless_missing_version_header_mismatch: PASS
+stateless_method_header_mismatch: PASS
+stateless_missing_method_header: PASS
+stateless_name_header_mismatch: PASS
+stateless_missing_name_header: PASS
+stateless_bad_base64_name_mismatch: PASS
+stateless_ping_removed: PASS
+stateless_unknown_method_404: PASS
+stateless_initialize_still_opens_session: PASS
 SET GLOBAL vsql_mcp.vsql_mcp_enabled = OFF;
 SET GLOBAL vsql_mcp.schema = '';
 SET GLOBAL vsql_mcp.allowed_tables = '';

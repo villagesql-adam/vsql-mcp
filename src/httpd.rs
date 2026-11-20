@@ -1,4 +1,5 @@
-//! HTTP transport for MCP Streamable HTTP (spec rev 2025-06-18).
+//! HTTP transport for MCP Streamable HTTP, in two eras on one endpoint: the
+//! stateless revision 2026-07-28, and 2025-06-18 with `initialize` and sessions.
 //!
 //! Owns listener lifecycle and every transport-level decision — status codes,
 //! headers, Origin validation, bearer auth, protocol-version negotiation, and
@@ -187,10 +188,24 @@ fn auth_ok(req: &Request, require_auth: bool, token: &str) -> bool {
     scheme.eq_ignore_ascii_case("Bearer") && secret_eq(credential, token)
 }
 
-fn protocol_ok(req: &Request) -> bool {
-    match header(req, "MCP-Protocol-Version") {
-        None => true, // spec: assume 2025-03-26
-        Some(v) => mcp::SUPPORTED_VERSIONS.contains(&v),
+/// The `MCP-Protocol-Version` header when it names a version this server does
+/// not speak. An absent header means 2025-03-26 (spec), which it does.
+fn unsupported_protocol(req: &Request) -> Option<String> {
+    header(req, "MCP-Protocol-Version")
+        .filter(|v| !mcp::SUPPORTED_VERSIONS.contains(v))
+        .map(str::to_owned)
+}
+
+/// Undo the `=?base64?...?=` form a client must use for an `Mcp-Name` value
+/// that is not plain ASCII. None when the encoded form does not decode.
+fn decode_header_value(value: &str) -> Option<String> {
+    use base64::Engine as _;
+    match value.strip_prefix("=?base64?").and_then(|v| v.strip_suffix("?=")) {
+        Some(encoded) => base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok()),
+        None => Some(value.to_owned()),
     }
 }
 
@@ -239,12 +254,8 @@ fn handle_post(request: Request) {
         respond_empty(request, 401);
         return;
     }
-    if !protocol_ok(&request) {
-        respond_json(
-            request,
-            400,
-            &mcp::error(&Json::Null, -32600, "unsupported MCP-Protocol-Version"),
-        );
+    if let Some(version) = unsupported_protocol(&request) {
+        respond_json(request, 400, &mcp::unsupported_version(&Json::Null, &version));
         return;
     }
 
@@ -320,6 +331,17 @@ fn handle_post(request: Request) {
         return;
     };
 
+    // A stateless client names its version in `_meta`; `initialize` always
+    // selects the session era, as the spec requires of a server that speaks both.
+    let meta = params.get("_meta");
+    let stateless = method != "initialize"
+        && (meta.and_then(|m| m.get(mcp::META_PROTOCOL_VERSION)).is_some()
+            || header(&request, "MCP-Protocol-Version") == Some(mcp::STATELESS_VERSION));
+    if stateless {
+        handle_stateless(request, method, params, meta, &id, &cfg);
+        return;
+    }
+
     if method == "initialize" {
         let session = mcp::new_session();
         let session_header = Header::from_bytes(&b"Mcp-Session-Id"[..], session.as_bytes())
@@ -348,6 +370,63 @@ fn handle_post(request: Request) {
     let exec = Loopback::new(&cfg.db_url, &cfg.schema, !cfg.allowed_tables.is_empty());
     let response = mcp::dispatch(method, params, &id, &cfg, &exec);
     respond_json(request, 200, &response);
+}
+
+/// Serve one request of the stateless revision. Each request stands alone: an
+/// `Mcp-Session-Id` header is ignored, and none is issued.
+///
+/// The routing headers must agree with the body, so that a proxy routing or
+/// rate-limiting on the header cannot be steered by a body that says otherwise.
+fn handle_stateless(request: Request, method: &str, params: &Json, meta: Option<&Json>, id: &Json, cfg: &RequestConfig) {
+    let version = meta.and_then(|m| m.get(mcp::META_PROTOCOL_VERSION)).and_then(Json::as_str);
+    let has_caps = meta
+        .and_then(|m| m.get(mcp::META_CLIENT_CAPABILITIES))
+        .is_some_and(Json::is_object);
+    let (Some(version), true) = (version, has_caps) else {
+        let msg = format!(
+            "params._meta must carry {} and {}",
+            mcp::META_PROTOCOL_VERSION,
+            mcp::META_CLIENT_CAPABILITIES
+        );
+        respond_json(request, 400, &mcp::error(id, -32602, &msg));
+        return;
+    };
+    if version != mcp::STATELESS_VERSION {
+        respond_json(request, 400, &mcp::unsupported_version(id, version));
+        return;
+    }
+
+    // Mcp-Name mirrors the tool name or resource URI, and only on the methods
+    // that have one. When the body has no value the header must be absent too.
+    let body_name = match method {
+        "tools/call" => params.get("name"),
+        "resources/read" => params.get("uri"),
+        _ => None,
+    };
+    let name_ok = match (header(&request, "Mcp-Name"), body_name.and_then(Json::as_str)) {
+        (None, None) => true,
+        (Some(h), Some(body)) => decode_header_value(h).as_deref() == Some(body),
+        _ => false,
+    };
+    let mismatch = if header(&request, "MCP-Protocol-Version") != Some(version) {
+        Some("MCP-Protocol-Version header does not match params._meta")
+    } else if header(&request, "Mcp-Method") != Some(method) {
+        Some("Mcp-Method header does not match the request method")
+    } else if !name_ok {
+        Some("Mcp-Name header does not match the request body")
+    } else {
+        None
+    };
+    if let Some(msg) = mismatch {
+        respond_json(request, 400, &mcp::error(id, -32020, &format!("Header mismatch: {msg}")));
+        return;
+    }
+
+    let exec = Loopback::new(&cfg.db_url, &cfg.schema, !cfg.allowed_tables.is_empty());
+    let response = mcp::dispatch_stateless(method, params, id, cfg, &exec);
+    // This revision answers an unknown method with 404, not 200.
+    let status = if response["error"]["code"] == -32601 { 404 } else { 200 };
+    respond_json(request, status, &response);
 }
 
 /// The outcome of a bounded body read.
