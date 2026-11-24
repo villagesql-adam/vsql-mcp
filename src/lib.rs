@@ -80,25 +80,29 @@ fn worker(reason: WakeupReason, _handle: &ThreadHandle) -> NextWakeup {
 static WORKER: ThreadWorkerCapability =
     ThreadWorkerCapability::new(worker, "vsql_mcp", POLL_INTERVAL, None);
 
-/// `info()` carries no per-row state; the stateful form exists only so its
-/// prerun can size the result buffer at call time (see `info_prerun`).
-struct InfoState;
+/// The `schema` setting as `info_prerun` read it. Each row reports this copy,
+/// so a concurrent `SET GLOBAL vsql_mcp.schema` cannot outgrow the buffer the
+/// prerun sized from it.
+struct InfoState {
+    schema: String,
+}
 
 /// prerun: size the result buffer from the live `schema` setting. Every other
 /// field is a bool, a small int, or a fixed protocol-version string, but
 /// `vsql_mcp.schema` is a free-form sys var with no length the SDK bounds (its
 /// `SysVarSpec::Str` carries no max), so a fixed `buffer_size` can't cover it.
 /// 256 bytes comfortably covers the rest of the JSON (measured fixed overhead
-/// is 147 bytes at worst-case field widths); `schema`'s length is added on top
-/// rather than guessed.
+/// is 147 bytes at worst-case field widths); `schema` is added at its
+/// JSON-escaped length, which is up to six times its raw length.
 fn info_prerun(_args: PrerunArgs, mut out: PrerunResult<InfoState>) {
-    out.request_buffer_size(256 + config::schema_setting().len());
-    out.set_state(InfoState);
+    let schema = config::schema_setting();
+    out.request_buffer_size(256 + serde_json::Value::from(schema.as_str()).to_string().len());
+    out.set_state(InfoState { schema });
 }
 
 /// SQL: `vsql_mcp.info()` -> STRING (JSON). A liveness probe callable without a
 /// database, so tests can assert server state without an HTTP round-trip.
-fn info_impl(_state: &mut InfoState, _args: &[InValue]) -> VdfReturn {
+fn info_impl(state: &mut InfoState, _args: &[InValue]) -> VdfReturn {
     let summary = json!({
         "enabled": ENABLED.load(Ordering::Relaxed),
         // True between `vsql_mcp_enabled = ON` and the bind attempt on the next
@@ -106,7 +110,7 @@ fn info_impl(_state: &mut InfoState, _args: &[InValue]) -> VdfReturn {
         "starting": PENDING_START.load(Ordering::Relaxed),
         "port": config::port(),
         "http_port": status::http_port(),
-        "schema": config::schema_setting(),
+        "schema": state.schema,
         "sessions_active": status::sessions_active(),
         "protocol_version": mcp::PROTOCOL_VERSION
     });
